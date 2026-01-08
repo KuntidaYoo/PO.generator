@@ -14,7 +14,4 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Outputs
-output_PO/
-*.xlsx
-*.log
+
