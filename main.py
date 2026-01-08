@@ -875,6 +875,33 @@ def generate_po_from_combined(
 
     po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
 
+    # ---- Find MIN/MAX columns from template (robust) ----
+    def _find_col_key(possible_keys):
+        for k in possible_keys:
+            if k in po_cols:
+                return k
+        return None
+
+    min_key_old = _find_col_key(["MIN*4", "MIN * 4", "MIN×4", "MIN x4", "MINX4"])
+    max_key_old = _find_col_key(["MAX*7", "MAX * 7", "MAX×7", "MAX x7", "MAXX7"])
+
+    if not min_key_old or not max_key_old:
+        raise RuntimeError(
+            f"Cannot find MIN/MAX header in template. "
+            f"Found keys: {list(po_cols.keys())[:30]}"
+        )
+
+    min_col_idx = po_cols[min_key_old]
+    max_col_idx = po_cols[max_key_old]
+
+    # Rename header cell text (display only)
+    ws.cell(HEADER_ROW, min_col_idx).value = f"MIN*{int(min_factor)}"
+    ws.cell(HEADER_ROW, max_col_idx).value = f"MAX*{int(max_factor)}"
+
+    # Use column letters for formulas
+    col_min = get_column_letter(min_col_idx)
+    col_max = get_column_letter(max_col_idx)
+
     # ---- Rename MIN/MAX header labels based on user input ----
     min_old = "MIN*4"
     max_old = "MAX*7"
@@ -1011,8 +1038,6 @@ def generate_po_from_combined(
 
         # Formula columns
         col_use       = get_column_letter(po_cols["USE MONTH"])
-        col_min = get_column_letter(po_cols[f"MIN*{int(min_factor)}"])
-        col_max = get_column_letter(po_cols[f"MAX*{int(max_factor)}"])
         col_sg        = get_column_letter(po_cols["STOCK GREEN"])
         col_sa        = get_column_letter(po_cols["STOCK ASIA"])
         col_on        = get_column_letter(po_cols["ON ORDER"])
