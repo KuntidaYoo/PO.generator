@@ -35,7 +35,7 @@ EXPRESS_FILES = [
     (EXPRESS_A_XLSX, "ASIA"),
     (EXPRESS_G_XLSX, "GREEN"),
 ]
-EXPRESS_SHEET = 0  # first sheet
+EXPRESS_SHEET = 0
 
 # Template assumptions
 TEMPLATE_SHEET_NAME = "page1"
@@ -45,13 +45,10 @@ TEMPLATE_ITEM_ROW = 9
 TEMPLATE_TOTAL_START_ROW = 14
 TEMPLATE_TOTAL_END_ROW = 16
 
-# Image behavior: make pictures wider by allowing width stretch
-# 1.00 = normal fit (keep aspect), 1.15 = allow 15% wider (still bounded by cell width)
+
 IMAGE_WIDTH_BOOST = 1.20
 IMAGE_PADDING_PX = 2
 
-# Totals block fixed locations (based on your file)
-# N is value, O must be blank
 TOTAL_VALUE_COL = "N"
 TOTAL_FORBIDDEN_COL = "O"
 
@@ -133,6 +130,18 @@ def parse_date_range_from_header(df_raw: pd.DataFrame) -> Dict[str, object]:
     print(">>> ไม่พบช่วงวันที่ ('วันที่จาก ... ถึง ...') ใน header")
     return {"raw_line": "", "start_date": None, "end_date": None, "days": 0, "months": 1}
 
+def is_2dp_num_token(t: str) -> bool:
+    s = str(t).replace(",", "").replace('"', "").strip()
+    return bool(re.fullmatch(r"-?\d+\.\d{2}", s))
+
+def get_2dp_numeric_tail(tokens: List[str]) -> List[str]:
+    tail = []
+    i = len(tokens) - 1
+    while i >= 0 and is_2dp_num_token(tokens[i]):
+        tail.append(tokens[i].replace('"', ""))
+        i -= 1
+    tail.reverse()
+    return tail
 
 # =========================
 # GENERAL UTILITIES
@@ -220,6 +229,9 @@ def split_product_field(s: str) -> Tuple[str, str]:
     if len(parts) < 2:
         return "", ""
     rest = parts[1].strip()
+    rest = re.sub(r"^[\.\}\{,\]]+\s*", "", rest)
+    rest = re.sub(r"^\d{2}-\d{2}-\d{4}(?:-[A-Za-z0-9]+)*\s+", "", rest)
+
     if not rest:
         return "", ""
 
@@ -248,7 +260,7 @@ def split_product_field(s: str) -> Tuple[str, str]:
         tag = ""
         if extra_tokens:
             t = extra_tokens[0]
-            if re.fullmatch(r"[A-Za-z]", t) or re.fullmatch(r"\([A-Za-z]\)", t):
+            if re.fullmatch(r"[A-Za-z]{1,5}", t) or re.fullmatch(r"\([A-Za-z]{1,5}\)", t):
                 tag = t
                 extra_tokens = extra_tokens[1:]
 
@@ -352,29 +364,44 @@ def parse_line_to_fields_merged(line: str) -> Optional[Dict[str, object]]:
     if not tokens:
         return None
 
+    # barcode
     barcode = ""
     idx = 0
     if idx < len(tokens) and re.fullmatch(r"\d+", tokens[idx]):
         barcode = tokens[idx]
         idx += 1
 
+    # product tokens (remove leading weird tokens like "." "}")
     product_tokens = tokens[idx:]
-    while product_tokens and product_tokens[0] in {".", "}"}:
+    while product_tokens and product_tokens[0] in {".", "}", "}."}:
         product_tokens = product_tokens[1:]
 
     if len(product_tokens) < 2:
         return None
 
-    sale, stock, on_order, yuan = parse_numeric_tail(tokens)
+    # --- NEW: numeric tail must be 2dp only (prevents '150' in description) ---
+    tail_nums = get_2dp_numeric_tail(product_tokens)
+
+    # business rule: tail usually 5 or 6 numbers with 2dp
+    # (if some lines have more, keep last 6)
+    if len(tail_nums) < 4:
+        return None
+    if len(tail_nums) > 6:
+        tail_nums = tail_nums[-6:]
+
+    # parse values using only the tail tokens
+    sale, stock, on_order, yuan = parse_numeric_tail(tail_nums)
 
     if stock is None or on_order is None:
         return None
     if sale is None:
         sale = 0.0
 
+    # remove ONLY 2dp tail from product_str
     end_idx = len(product_tokens)
-    while end_idx > 0 and is_num_token(product_tokens[end_idx - 1]):
+    while end_idx > 0 and is_2dp_num_token(product_tokens[end_idx - 1]):
         end_idx -= 1
+
     product_str = " ".join(product_tokens[:end_idx]).strip()
 
     return {
