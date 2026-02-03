@@ -21,6 +21,7 @@ from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 from openpyxl.drawing.xdr import XDRPositiveSize2D
 
+
 # =========================
 # CONFIG
 # =========================
@@ -35,7 +36,7 @@ EXPRESS_FILES = [
     (EXPRESS_A_XLSX, "ASIA"),
     (EXPRESS_G_XLSX, "GREEN"),
 ]
-EXPRESS_SHEET = 0
+EXPRESS_SHEET = 0  # first sheet
 
 # Template assumptions
 TEMPLATE_SHEET_NAME = "page1"
@@ -45,10 +46,11 @@ TEMPLATE_ITEM_ROW = 9
 TEMPLATE_TOTAL_START_ROW = 14
 TEMPLATE_TOTAL_END_ROW = 16
 
-
+# Image behavior
 IMAGE_WIDTH_BOOST = 1.20
 IMAGE_PADDING_PX = 2
 
+# Totals block fixed locations (based on your file)
 TOTAL_VALUE_COL = "N"
 TOTAL_FORBIDDEN_COL = "O"
 
@@ -130,18 +132,6 @@ def parse_date_range_from_header(df_raw: pd.DataFrame) -> Dict[str, object]:
     print(">>> ไม่พบช่วงวันที่ ('วันที่จาก ... ถึง ...') ใน header")
     return {"raw_line": "", "start_date": None, "end_date": None, "days": 0, "months": 1}
 
-def is_2dp_num_token(t: str) -> bool:
-    s = str(t).replace(",", "").replace('"', "").strip()
-    return bool(re.fullmatch(r"-?\d+\.\d{2}", s))
-
-def get_2dp_numeric_tail(tokens: List[str]) -> List[str]:
-    tail = []
-    i = len(tokens) - 1
-    while i >= 0 and is_2dp_num_token(tokens[i]):
-        tail.append(tokens[i].replace('"', ""))
-        i -= 1
-    tail.reverse()
-    return tail
 
 # =========================
 # GENERAL UTILITIES
@@ -229,9 +219,6 @@ def split_product_field(s: str) -> Tuple[str, str]:
     if len(parts) < 2:
         return "", ""
     rest = parts[1].strip()
-    rest = re.sub(r"^[\.\}\{,\]]+\s*", "", rest)
-    rest = re.sub(r"^\d{2}-\d{2}-\d{4}(?:-[A-Za-z0-9]+)*\s+", "", rest)
-
     if not rest:
         return "", ""
 
@@ -260,7 +247,7 @@ def split_product_field(s: str) -> Tuple[str, str]:
         tag = ""
         if extra_tokens:
             t = extra_tokens[0]
-            if re.fullmatch(r"[A-Za-z]{1,5}", t) or re.fullmatch(r"\([A-Za-z]{1,5}\)", t):
+            if re.fullmatch(r"[A-Za-z]", t) or re.fullmatch(r"\([A-Za-z]\)", t):
                 tag = t
                 extra_tokens = extra_tokens[1:]
 
@@ -283,22 +270,54 @@ def split_product_field(s: str) -> Tuple[str, str]:
 
 
 # =========================
-# Parse numeric tail
+# Parse numeric tail (FIXED)
 # =========================
 def is_num_token(t: str) -> bool:
+    """
+    True ONLY for pure numeric tokens.
+    Reject tokens that contain letters or dash to avoid grabbing BM-150, 01-24-8501, etc.
+    """
     s = t.replace(",", "").replace('"', "").strip()
+    if re.search(r"[A-Za-z\-]", s):
+        return False
     return bool(re.fullmatch(r"-?\d+(\.\d+)?", s))
 
 def parse_numeric_tail(tokens: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Extract numeric tail values from a merged line.
+
+    Key fix:
+    - Ignore integers like '150' that appear in description.
+    - Start parsing numbers only from the FIRST token that looks like money: r'^\d+(\,\d{3})*(\.\d{2})$'
+      (i.e. has exactly 2 decimal places)
+    """
+    def clean_num_text(t: str) -> str:
+        return t.replace(",", "").replace('"', "").strip()
+
+    money_pat = re.compile(r"^-?\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^-?\d+(?:\.\d{2})$")
+
+    # 1) Find first money-like token position (e.g. 559.00). Ignore earlier integers (e.g. 150).
+    start_i = None
+    for i, t in enumerate(tokens):
+        tt = clean_num_text(t)
+        if money_pat.fullmatch(tt):
+            start_i = i
+            break
+
+    if start_i is None:
+        return None, None, None, None
+
+    tail_tokens = tokens[start_i:]
+
+    # 2) Collect numeric tokens from that point onward
     num_texts: List[str] = []
     num_vals: List[Optional[float]] = []
-
-    for t in tokens:
-        if is_num_token(t):
-            num_texts.append(t)
-            s = t.replace(",", "").replace('"', "").strip()
+    for t in tail_tokens:
+        tt = clean_num_text(t)
+        if re.fullmatch(r"-?\d+(\.\d+)?", tt):  # numeric
+            num_texts.append(tt)
             try:
-                num_vals.append(float(s))
+                num_vals.append(float(tt))
             except ValueError:
                 num_vals.append(None)
 
@@ -306,23 +325,23 @@ def parse_numeric_tail(tokens: List[str]) -> Tuple[Optional[float], Optional[flo
     if n < 3:
         return None, None, None, None
 
+    # Keep only last 7 numeric tokens if too long
     if n > 7:
         num_texts = num_texts[-7:]
         num_vals = num_vals[-7:]
         n = len(num_texts)
 
+    # 3) Detect yuan (same rule as before) but only if last token looks like money (2dp)
     has_yuan = False
-    if n >= 6:
+    if n >= 4:
+        last_text = num_texts[-1]
         last_val = num_vals[-1]
-        last_text = num_texts[-1].replace(",", "").replace('"', "").strip()
-        last_has_decimal = "." in last_text
-        if last_val is not None and last_has_decimal and 0 < last_val < 1000:
+        if last_val is not None and (".") in last_text and 0 <= last_val < 1000:
             has_yuan = True
 
     def to_float(text: str) -> Optional[float]:
-        s = text.replace(",", "").replace('"', "").strip()
         try:
-            return float(s)
+            return float(text)
         except ValueError:
             return None
 
@@ -331,6 +350,7 @@ def parse_numeric_tail(tokens: List[str]) -> Tuple[Optional[float], Optional[flo
     on_order_val = None
     yuan_val = None
 
+    # 4) Your existing mapping logic (unchanged) — now works better because 150 is removed
     if has_yuan:
         yuan_val = to_float(num_texts[-1])
         if n >= 7:
@@ -364,45 +384,35 @@ def parse_line_to_fields_merged(line: str) -> Optional[Dict[str, object]]:
     if not tokens:
         return None
 
-    # barcode
     barcode = ""
     idx = 0
     if idx < len(tokens) and re.fullmatch(r"\d+", tokens[idx]):
         barcode = tokens[idx]
         idx += 1
 
-    # product tokens (remove leading weird tokens like "." "}")
     product_tokens = tokens[idx:]
-    while product_tokens and product_tokens[0] in {".", "}", "}."}:
+    while product_tokens and product_tokens[0] in {".", "}"}:
         product_tokens = product_tokens[1:]
 
     if len(product_tokens) < 2:
         return None
 
-    # --- NEW: numeric tail must be 2dp only (prevents '150' in description) ---
-    tail_nums = get_2dp_numeric_tail(product_tokens)
-
-    # business rule: tail usually 5 or 6 numbers with 2dp
-    # (if some lines have more, keep last 6)
-    if len(tail_nums) < 4:
-        return None
-    if len(tail_nums) > 6:
-        tail_nums = tail_nums[-6:]
-
-    # parse values using only the tail tokens
-    sale, stock, on_order, yuan = parse_numeric_tail(tail_nums)
+    sale, stock, on_order, yuan = parse_numeric_tail(tokens)
 
     if stock is None or on_order is None:
         return None
     if sale is None:
         sale = 0.0
 
-    # remove ONLY 2dp tail from product_str
     end_idx = len(product_tokens)
-    while end_idx > 0 and is_2dp_num_token(product_tokens[end_idx - 1]):
+    while end_idx > 0 and is_num_token(product_tokens[end_idx - 1]):
         end_idx -= 1
-
     product_str = " ".join(product_tokens[:end_idx]).strip()
+
+    # Uncomment if you need debug:
+    # if yuan is None:
+    #     nums_dbg = [t for t in tokens if is_num_token(t)]
+    #     print("⚠️ yuan missing | buyer=", buyer, "| nums_tail=", nums_dbg[-7:], "| line=", line[:160])
 
     return {
         "buyer": buyer,
@@ -599,7 +609,7 @@ def build_catalog_map(catalog_path: str, vendor_code: str, header_row: int = 1) 
 
 
 # =========================
-# Excel helpers (style, borders, copy ranges)
+# Excel helpers
 # =========================
 def copy_column_widths(src_ws, dst_ws):
     for col_letter, dim in src_ws.column_dimensions.items():
@@ -662,7 +672,7 @@ def add_signature_under_last_item(ws, last_item_row: int,
 
 
 # =========================
-# IMAGE placement (make wider)
+# IMAGE placement
 # =========================
 def _excel_colwidth_to_pixels(width):
     if width is None:
@@ -702,16 +712,13 @@ def add_image_to_cell(ws, cell_addr: str, img_bytes: bytes,
 
     cell_w_px, cell_h_px = _get_cell_rect_pixels(ws, col_letter, row_num)
 
-    # Allow a bit wider usage (still bounded by cell width)
     max_w = max(1, int((cell_w_px - padding_px) * width_boost))
     max_w = min(max_w, cell_w_px - padding_px)
-
     max_h = max(1, cell_h_px - padding_px)
 
     pil = PILImage.open(BytesIO(img_bytes)).convert("RGBA")
     w, h = pil.size
 
-    # Keep aspect ratio, but "prefer" fitting width a bit more
     scale = min(max_w / w, max_h / h, 1.0)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
@@ -763,7 +770,7 @@ def get_po_col_map(ws, header_row=HEADER_ROW):
 
 
 # =========================
-# TOTAL block: copy + fix formulas (NO label scanning)
+# TOTAL block
 # =========================
 def paste_total_block_and_fix(
     ws,
@@ -772,10 +779,9 @@ def paste_total_block_and_fix(
     po_last_col: int,
     item_start_row: int,
     last_item_row: int,
-    col_amt: str,          # AMOUNT (CNY) column letter (usually "N")
+    col_amt: str,
     rate_thb_per_cny: float,
 ):
-    # Copy template total block rows 14..16
     copy_template_rows(
         template_ws, ws,
         TEMPLATE_TOTAL_START_ROW, TEMPLATE_TOTAL_END_ROW,
@@ -783,11 +789,10 @@ def paste_total_block_and_fix(
         max_col=po_last_col
     )
 
-    r1 = total_block_start       # row for "TOTAL AMOUNT CNY"
-    r_mid = r1 + 1               # row for "EXC RATE"
-    r2 = r1 + 2                  # row for "TOTAL AMOUNT THB"
+    r1 = total_block_start
+    r_mid = r1 + 1
+    r2 = r1 + 2
 
-    # Rewrite any template SUM ranges that still end at row 13 -> last_item_row
     sum_pat = re.compile(
         rf'(SUM\()(\$?[A-Z]{{1,3}}\$?){item_start_row}:(\$?[A-Z]{{1,3}}\$?)13(\))',
         flags=re.IGNORECASE
@@ -801,529 +806,7 @@ def paste_total_block_and_fix(
                     v
                 )
 
-    # ---- FORCE the exact cells we want ----
-    # O column must be blank (this is where your unwanted formulas show up)
     ws[f"O{r1}"].value = None
     ws[f"O{r2}"].value = None
 
-    # N33 = Total Amount CNY (sum AMOUNT(CNY))
-    ws[f"N{r1}"].value = f"=SUM({col_amt}{item_start_row}:{col_amt}{last_item_row})"
-
-    # N34 = Exchange rate
-    ws[f"N{r_mid}"].value = rate_thb_per_cny
-
-    # N35 = N34 * N33 (NOT a SUM)
-    ws[f"N{r2}"].value = f"=N{r_mid}*N{r1}"
-
-def find_label_cell(ws, label: str, max_row: int = 60, max_col: int = 30):
-    """
-    Find a cell whose text equals `label` (trimmed).
-    Returns (row, col) or None.
-    """
-    target = norm_text(label)
-    for r in range(1, min(max_row, ws.max_row) + 1):
-        for c in range(1, min(max_col, ws.max_column) + 1):
-            if norm_text(ws.cell(r, c).value) == target:
-                return r, c
-    return None
-
-def is_missing_number(x) -> bool:
-    # True for None, "", NaN, <=0
-    if x is None:
-        return True
-    try:
-        # handles pandas/numpy NaN
-        if isinstance(x, float) and math.isnan(x):
-            return True
-    except Exception:
-        pass
-    try:
-        return float(x) <= 0
-    except Exception:
-        s = str(x).strip()
-        return s == ""
-
-
-def top_left_if_merged(ws, row: int, col: int) -> tuple[int, int]:
-    """If (row,col) is inside a merged range, return the top-left cell of that range."""
-    for mr in ws.merged_cells.ranges:
-        if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
-            return mr.min_row, mr.min_col
-    return row, col
-
-
-# =========================
-# Generate PO
-# =========================
-def generate_po_from_combined(
-    combined_df: pd.DataFrame,
-    vendor_code: str,
-    po_date: Optional[datetime.date] = None,
-    rate_thb_per_cny: float = 6.0,
-    template_path: str = TEMPLATE_PO_XLSX,
-    catalog_path: str = CATALOG_XLSX,
-    vendor_info_path: str = VENDOR_INFO_XLSX,
-    min_factor: int = 4,
-    max_factor: int = 7,
-) -> str:
-
-    if po_date is None:
-        po_date = datetime.date.today()
-
-    os.makedirs(PO_OUTPUT_FOLDER, exist_ok=True)
-    output_path = os.path.join(PO_OUTPUT_FOLDER, f"PO_{vendor_code}.xlsx")
-
-    vendor_key = str(vendor_code).strip().upper()
-
-    vendor_map_raw = load_vendor_map(vendor_info_path)
-    # normalize keys to avoid "A0010 " vs "a0010"
-    vendor_map = {str(k).strip().upper(): v for k, v in vendor_map_raw.items()}
-
-    supplier_name = vendor_map.get(vendor_key, {}).get("name", "")
-    supplier_addr = vendor_map.get(vendor_key, {}).get("address", "")
-
-    print("DEBUG vendor_key =", vendor_key)
-    print("DEBUG supplier_name =", supplier_name)
-    print("DEBUG supplier_addr =", supplier_addr)
-
-    catalog_map = {}
-    if os.path.exists(catalog_path):
-        catalog_map = build_catalog_map(catalog_path, vendor_code=vendor_code, header_row=1)
-    else:
-        print(f"⚠️ Catalog not found: {catalog_path}")
-
-    wb = openpyxl.load_workbook(template_path)
-    template_ws = wb[TEMPLATE_SHEET_NAME]
-    ws = wb.copy_worksheet(template_ws)
-    ws.title = "PO"
-
-    copy_column_widths(template_ws, ws)
-    ws.column_dimensions["B"].width = (ws.column_dimensions["B"].width or 18) + 6
-
-    po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
-
-    # ---- Find MIN/MAX columns from template (robust) ----
-    def _find_col_key(possible_keys):
-        for k in possible_keys:
-            if k in po_cols:
-                return k
-        return None
-
-    min_key_old = _find_col_key(["MIN*4", "MIN * 4", "MIN×4", "MIN x4", "MINX4"])
-    max_key_old = _find_col_key(["MAX*7", "MAX * 7", "MAX×7", "MAX x7", "MAXX7"])
-
-    if not min_key_old or not max_key_old:
-        raise RuntimeError(
-            f"Cannot find MIN/MAX header in template. "
-            f"Found keys: {list(po_cols.keys())[:30]}"
-        )
-
-    min_col_idx = po_cols[min_key_old]
-    max_col_idx = po_cols[max_key_old]
-
-    # Rename header cell text (display only)
-    ws.cell(HEADER_ROW, min_col_idx).value = f"MIN*{int(min_factor)}"
-    ws.cell(HEADER_ROW, max_col_idx).value = f"MAX*{int(max_factor)}"
-
-    # Use column letters for formulas
-    col_min = get_column_letter(min_col_idx)
-    col_max = get_column_letter(max_col_idx)
-
-    # ---- Rename MIN/MAX header labels based on user input ----
-    min_old = "MIN*4"
-    max_old = "MAX*7"
-
-    min_new = f"MIN*{int(min_factor)}"
-    max_new = f"MAX*{int(max_factor)}"
-
-    # Rename header cells in the sheet (only if the old headers exist)
-    if min_old in po_cols:
-        c = po_cols[min_old]
-        ws.cell(HEADER_ROW, c).value = min_new
-        # update mapping so later code can use the new name
-        po_cols[min_new] = c
-        del po_cols[min_old]
-
-    if max_old in po_cols:
-        c = po_cols[max_old]
-        ws.cell(HEADER_ROW, c).value = max_new
-        po_cols[max_new] = c
-        del po_cols[max_old]
-
-    PO_LAST_COL = max(po_cols.values())
-
-    # Required column letters
-    col_cart = get_column_letter(po_cols["CARTONS"])
-    col_tot_order = get_column_letter(po_cols["TOTAL QTY (ORDER)"])
-    col_amt = get_column_letter(po_cols["AMOUNT (CNY)"])
-    col_thb = get_column_letter(po_cols["THB"])
-
-    # Header fields
-    ws["H6"] = vendor_code
-    ws["H6"].font = Font(color="FF0000", bold=True, size=18)
-
-    # ---- WRITE HEADER FIELDS BY LABEL (safe + flexible) ----
-    # DATE label -> write to the cell right next to it
-    pos = find_label_cell(ws, "DATE", max_row=20, max_col=30)
-    if pos:
-        r, c = pos
-        ws.cell(r, c + 1).value = po_date
-
-    # SUPPLIER label -> write next to it
-    pos = find_label_cell(ws, "SUPPLIER", max_row=20, max_col=30)
-    if pos and supplier_name:
-        r, c = pos
-        ws.cell(r, c + 1).value = supplier_name
-
-    # ADDRESS label -> write next to it
-    pos = find_label_cell(ws, "ADDRESS", max_row=25, max_col=30)
-    if pos and supplier_addr:
-        r, c = pos
-        ws.cell(r, c + 1).value = supplier_addr
-
-    # Logo
-    if os.path.exists("logo.png"):
-        logo_img = XLImage("logo.png")
-        logo_img.width = 210
-        logo_img.height = 110
-        ws.add_image(logo_img, "A1")
-
-    # Sort products
-    combined_df = (
-        combined_df.sort_values(by=["รหัสสินค้า", "รายละเอียดสินค้า"], ascending=[True, True])
-        .reset_index(drop=True)
-    )
-
-    current_row = ITEM_START_ROW
-
-    for _, row in combined_df.iterrows():
-        line = current_row
-        current_row += 1
-
-        copy_row_style(ws, TEMPLATE_ITEM_ROW, line, PO_LAST_COL)
-        copy_row_height(ws, TEMPLATE_ITEM_ROW, line)
-
-        buyer_item = str(row["รหัสสินค้า"]).strip()
-        cat = catalog_map.get(buyer_item, {})
-
-        qty_per_carton = cat.get("qty_per_carton", "")
-        try:
-            qty_per_carton_num = float(qty_per_carton) if qty_per_carton not in [None, ""] else 0.0
-        except:
-            qty_per_carton_num = 0.0
-
-
-
-        use_month = int(row["USE_MONTH"]) if not pd.isna(row["USE_MONTH"]) else 0
-        total_qty_num = float(row["TOTAL_QTY_NUM"])
-        max_num = float(row["MAX_NUM"])
-        units_to_order = max_num - total_qty_num
-
-        if units_to_order < 0:
-            units_to_order = 0
-
-        if qty_per_carton_num > 0:
-            cartons = round_half_up(units_to_order / qty_per_carton_num)
-        else:
-            cartons = 0
-
-        yuan = row["หยวน"] if not pd.isna(row["หยวน"]) else None
-        try:
-            yuan_num = float(yuan) if yuan is not None else None
-        except:
-            yuan_num = None
-
-        # Static fields
-        ws.cell(line, po_cols["BUYER ITEM NO."]).value = buyer_item
-
-        if cat.get("img_bytes"):
-            add_image_to_cell(ws, f"B{line}", cat["img_bytes"])
-
-        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = cat.get("goods_desc", row.get("รายละเอียดสินค้า", ""))
-        ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
-        ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
-        ws.cell(line, po_cols["Weight"]).value = cat.get("weight", "")
-        ws.cell(line, po_cols["QTY PER CARTON"]).value = (
-            qty_per_carton_num if qty_per_carton_num > 0 else None
-        )
-
-        # ----- WRITE WARNING TEXT IN COLUMN X -----
-        cell_x = ws[f"X{line}"]
-
-        if qty_per_carton_num <= 0:
-            cell_x.value = (
-                "QTY PER CARTON is missing. "
-                "Please update product catalog or supplier in EXPRESS"
-            )
-        else:
-            cell_x.value = None
-
-        ws.cell(line, po_cols["STOCK GREEN"]).value = float(row["STOCK_GREEN"])
-        ws.cell(line, po_cols["STOCK ASIA"]).value = float(row["STOCK_ASIA"])
-        ws.cell(line, po_cols["ON ORDER"]).value = float(row["ON_ORDER_TOTAL"])
-        ws.cell(line, po_cols["USE MONTH"]).value = use_month
-
-        # Formula columns
-        col_use       = get_column_letter(po_cols["USE MONTH"])
-        col_sg        = get_column_letter(po_cols["STOCK GREEN"])
-        col_sa        = get_column_letter(po_cols["STOCK ASIA"])
-        col_on        = get_column_letter(po_cols["ON ORDER"])
-        col_tq        = get_column_letter(po_cols["TOTAL QTY"])
-        col_zan       = get_column_letter(po_cols["จน./USE MONTH"])
-        col_remain0   = get_column_letter(po_cols["คงเหลือ (จน./USE MONTH เดิม)"])
-        col_qpc       = get_column_letter(po_cols["QTY PER CARTON"])
-        col_green     = get_column_letter(po_cols["GREEN"])
-        col_asia      = get_column_letter(po_cols["ASIA"])
-        col_fob       = get_column_letter(po_cols["FOB PRICE (CNY)"])
-
-        ws[f"{col_min}{line}"] = f"={col_use}{line}*{int(min_factor)}"
-        ws[f"{col_max}{line}"] = f"={col_use}{line}*{int(max_factor)}"
-
-        # TOTAL QTY
-        ws[f"{col_tq}{line}"] = f"={col_sg}{line}+{col_sa}{line}+{col_on}{line}"
-        # จน./USE MONTH
-        ws[f"{col_zan}{line}"] = f"=ROUND(({col_tq}{line}+{col_tot_order}{line})/{col_use}{line},0)"
-        # คงเหลือ (เดิม)
-        ws[f"{col_remain0}{line}"] = f"=ROUND({col_tq}{line}/{col_use}{line},0)"
-        # CARTONS
-        ws[f"{col_cart}{line}"] = f"=ROUND(({col_max}{line}-{col_tq}{line})/{col_qpc}{line},0)"
-        # GREEN
-        ws[f"{col_green}{line}"] = f"={col_cart}{line}*{col_qpc}{line}"
-        # ASIA
-        ws[f"{col_asia}{line}"] = 0
-        # TOTAL QTY (ORDER)
-        ws[f"{col_tot_order}{line}"] = f"={col_green}{line}+{col_asia}{line}"
-
-        # FOB + THB
-        if yuan_num is not None:
-            ws[f"{col_fob}{line}"] = yuan_num
-            ws[f"{col_thb}{line}"] = yuan_num * rate_thb_per_cny
-        else:
-            ws[f"{col_fob}{line}"] = None
-            ws[f"{col_thb}{line}"] = None
-
-        # AMOUNT (CNY)
-        ws[f"{col_amt}{line}"] = f"={col_fob}{line}*{col_tot_order}{line}"
-
-    # TOTAL block
-    if len(combined_df) > 0:
-        last_item_row = ITEM_START_ROW + len(combined_df) - 1
-        force_bottom_border(ws, last_item_row, 1, PO_LAST_COL)
-
-        total_block_start = last_item_row + 1
-        paste_total_block_and_fix(
-            ws=ws,
-            template_ws=template_ws,
-            total_block_start=total_block_start,
-            po_last_col=PO_LAST_COL,
-            item_start_row=ITEM_START_ROW,
-            last_item_row=last_item_row,
-            col_amt=col_amt,
-            rate_thb_per_cny=rate_thb_per_cny,
-        )
-
-        total_block_end = total_block_start + 2
-        add_signature_under_last_item(
-            ws,
-            last_item_row=total_block_end,
-            sig_path="footer_signatures.png",
-            gap_rows=4,
-            anchor_col="A",
-        )
-
-    # Remove original template sheet so only 'PO' remains
-    wb.remove(template_ws)
-    wb.save(output_path)
-    print(f"✔ PO created: {output_path}")
-    return output_path
-
-
-# =========================
-# Trace export (optional, kept)
-# =========================
-def export_trace_for_vendor(vendor_combined: pd.DataFrame,
-                            df_asia: pd.DataFrame,
-                            df_green: pd.DataFrame,
-                            vendor_code: str,
-                            out_folder: str = PO_OUTPUT_FOLDER) -> str:
-    if vendor_combined.empty:
-        print(f"⚠️ No items for vendor {vendor_code}, skip trace export.")
-        return ""
-
-    os.makedirs(out_folder, exist_ok=True)
-    out_path = os.path.join(out_folder, f"PO_{vendor_code}_trace.xlsx")
-
-    vendor_sorted = vendor_combined.sort_values(by=["รหัสสินค้า", "รายละเอียดสินค้า"]).reset_index(drop=True)
-
-    trace_rows: List[Dict[str, object]] = []
-    for po_idx, crow in vendor_sorted.iterrows():
-        buyer = crow["buyer"]
-        code = crow["รหัสสินค้า"]
-        desc = crow.get("รายละเอียดสินค้า", "")
-        po_line_no = po_idx + 1
-
-        subset_asia = df_asia[(df_asia["buyer"] == buyer) & (df_asia["รหัสสินค้า"] == code)]
-        for _, ar in subset_asia.iterrows():
-            trace_rows.append({
-                "PO_LINE": po_line_no,
-                "source": "ASIA",
-                "buyer": buyer,
-                "รหัสสินค้า": code,
-                "รายละเอียดสินค้า(PO)": desc,
-                "src_file": ar.get("src_file", ""),
-                "src_row": ar.get("src_row", ""),
-                "barcode": ar.get("barcode", ""),
-                "ยอดขาย": ar.get("ยอดขาย", ""),
-                "สินค้าคงเหลือ": ar.get("สินค้าคงเหลือ", ""),
-                "ON_ORDER": ar.get("ON_ORDER", ""),
-                "หยวน": ar.get("หยวน", ""),
-            })
-
-        subset_green = df_green[(df_green["buyer"] == buyer) & (df_green["รหัสสินค้า"] == code)]
-        for _, gr in subset_green.iterrows():
-            trace_rows.append({
-                "PO_LINE": po_line_no,
-                "source": "GREEN",
-                "buyer": buyer,
-                "รหัสสินค้า": code,
-                "รายละเอียดสินค้า(PO)": desc,
-                "src_file": gr.get("src_file", ""),
-                "src_row": gr.get("src_row", ""),
-                "barcode": gr.get("barcode", ""),
-                "ยอดขาย": gr.get("ยอดขาย", ""),
-                "สินค้าคงเหลือ": gr.get("สินค้าคงเหลือ", ""),
-                "ON_ORDER": gr.get("ON_ORDER", ""),
-                "หยวน": gr.get("หยวน", ""),
-            })
-
-    if not trace_rows:
-        print(f"⚠️ No matching ASIA/GREEN lines found for vendor {vendor_code}.")
-        return ""
-
-    df_trace = pd.DataFrame(trace_rows).sort_values(by=["PO_LINE", "source", "src_file", "src_row"]).reset_index(drop=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        df_trace.to_excel(writer, sheet_name="trace", index=False)
-
-    print(f"✔ Trace file created: {out_path}")
-    return out_path
-
-
-# =========================
-# MAIN
-# =========================
-def main():
-    df_asia = pd.DataFrame()
-    df_green = pd.DataFrame()
-    months_global = None
-
-    for path, label in EXPRESS_FILES:
-        if not os.path.exists(path):
-            print(f"⚠️ File not found, skipping: {path}")
-            continue
-
-        df_raw = pd.read_excel(path, sheet_name=EXPRESS_SHEET, header=None, dtype=str)
-        date_info = parse_date_range_from_header(df_raw)
-        months = date_info["months"] if date_info["months"] > 0 else 1
-
-        if months_global is None:
-            months_global = months
-        elif months_global != months:
-            print(f"⚠️ Months differ between files, using {months_global}")
-
-        df_tmp, _ = parse_express_file(path, label)
-        if label == "ASIA":
-            df_asia = df_tmp
-        else:
-            df_green = df_tmp
-
-    if months_global is None:
-        months_global = 1
-
-    print(f">>> Months used for USE_MONTH: {months_global}")
-    combined = combine_asia_green(df_asia, df_green, months=months_global)
-
-    vendor = input("กรุณาระบุรหัส Vendor เช่น A0029: ").strip()
-    if not vendor:
-        print("ไม่ได้ระบุ Vendor code, stop.")
-        return
-
-    date_str = input("ระบุวันที่ PO (รูปแบบ YYYY-MM-DD, ว่าง = วันนี้): ").strip()
-    if date_str:
-        try:
-            po_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-        except ValueError:
-            print("รูปแบบวันที่ไม่ถูกต้อง ใช้วันที่วันนี้แทน")
-            po_date = datetime.date.today()
-    else:
-        po_date = datetime.date.today()
-
-    vendor_combined = combined[combined["buyer"] == vendor].copy()
-    if vendor_combined.empty:
-        print(f"⚠️ No rows after filter for vendor {vendor}")
-        return
-
-    generate_po_from_combined(
-        combined_df=vendor_combined,
-        vendor_code=vendor,
-        po_date=po_date,
-        rate_thb_per_cny=6.0,
-    )
-
-    export_trace_for_vendor(
-        vendor_combined=vendor_combined,
-        df_asia=df_asia,
-        df_green=df_green,
-        vendor_code=vendor,
-    )
-
-def generate_po_streamlit(
-    express_asia_path: str,
-    express_green_path: str,
-    catalog_path: str,
-    vendor_info_path: str,
-    template_path: str,
-    vendor_code: str,
-    po_date: datetime.date,
-    rate_thb_per_cny: float = 6.0,
-    min_factor: int = 4,
-    max_factor: int = 7,
-) -> str:
-    # parse both express files
-    df_asia, info_a = parse_express_file(express_asia_path, "ASIA")
-    df_green, info_g = parse_express_file(express_green_path, "GREEN")
-
-    # use months from header (same logic you already had)
-    months_a = info_a.get("months", 1) or 1
-    months_g = info_g.get("months", 1) or 1
-    months_global = months_a if months_a == months_g else months_a
-
-    combined = combine_asia_green(
-        df_asia=df_asia,
-        df_green=df_green,
-        months=months_global,
-        min_factor=min_factor,
-        max_factor=max_factor,
-    )
-
-    vendor_key = vendor_code.strip()
-    vendor_combined = combined[combined["buyer"] == vendor_key].copy()
-    if vendor_combined.empty:
-        raise RuntimeError(f"No rows after filter for vendor {vendor_key}")
-
-    out_path = generate_po_from_combined(
-        combined_df=vendor_combined,
-        vendor_code=vendor_key,
-        po_date=po_date,
-        rate_thb_per_cny=rate_thb_per_cny,
-        template_path=template_path,
-        catalog_path=catalog_path,
-        vendor_info_path=vendor_info_path,
-        min_factor=min_factor,
-        max_factor=max_factor,
-    )
-    return out_path
-
-
-if __name__ == "__main__":
-    main()
-
+    ws[f"N{r1}
