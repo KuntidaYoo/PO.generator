@@ -76,7 +76,7 @@ if btn:
         p_template.write_bytes(template_repo_path.read_bytes())
 
         # run your pipeline in main.py
-        out_path = main.generate_po_streamlit(
+        result = main.generate_po_streamlit(
             express_asia_path=str(p_asia),
             express_green_path=str(p_green),
             catalog_path=str(p_catalog),
@@ -89,12 +89,29 @@ if btn:
             max_factor=int(max_factor),
         )
 
-        out_bytes = Path(out_path).read_bytes()
-        st.success("สร้าง PO สำเร็จ ✅")
+        st.success(
+            f"เสร็จแล้ว ✅ Vendor {vendor_code.strip().upper()} | "
+            f"All items: {result['count_all']} | Below MIN: {result['count_filtered']}"
+        )
 
+        # 1) ALL items (always)
+        all_bytes = Path(result["po_all_items"]).read_bytes()
         st.download_button(
-            "Download PO",
-            data=out_bytes,
-            file_name=f"PO_{vendor_code.strip().upper()}.xlsx",
+            "Download ALL items (no MIN filter)",
+            data=all_bytes,
+            file_name=f"PO_{vendor_code.strip().upper()}_ALL_ITEMS.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+        # 2) Filtered PO (only if exists)
+        if result["po_filtered"]:
+            po_bytes = Path(result["po_filtered"]).read_bytes()
+            st.download_button(
+                "Download PO (only below MIN)",
+                data=po_bytes,
+                file_name=f"PO_{vendor_code.strip().upper()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.info("Vendor นี้ไม่มีรายการที่ต่ำกว่า MIN → ไม่มีไฟล์ PO แบบ filtered")
+
