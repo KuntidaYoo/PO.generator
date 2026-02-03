@@ -556,55 +556,69 @@ def combine_asia_green(df_asia: pd.DataFrame, df_green: pd.DataFrame,
 # =========================
 # Catalog map + images
 # =========================
-def build_catalog_map(catalog_path: str, vendor_code: str, header_row: int = 1) -> dict:
+def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
+
     wb = openpyxl.load_workbook(catalog_path)
 
-    if vendor_code in wb.sheetnames:
-        ws = wb[vendor_code]
+    # ===== pick vendor sheet (tab name = vendor code) =====
+    want = str(vendor_code).strip().upper()
+    norm_map = {str(name).strip().upper(): name for name in wb.sheetnames}
+
+    if want in norm_map:
+        ws = wb[norm_map[want]]
     else:
-        matched = None
-        for name in wb.sheetnames:
-            if vendor_code.lower() in name.lower():
-                matched = name
+        ws = None
+        for k_norm, original in norm_map.items():
+            if want in k_norm or k_norm in want:
+                ws = wb[original]
                 break
-        ws = wb[matched] if matched else wb.active
-        print(f"⚠️ Sheet '{vendor_code}' not found, using '{ws.title}' instead.")
+        if ws is None:
+            raise RuntimeError(
+                f"Catalog workbook has no sheet for vendor '{want}'. "
+                f"Available sheets: {wb.sheetnames}"
+            )
 
-    header = [norm_text(ws.cell(header_row, c).value) for c in range(1, ws.max_column + 1)]
+    # ===== FIXED COLUMN MAPPING (by Excel column) =====
+    COL_ITEM_NO   = 1  # A
+    COL_PICTURE   = 2  # B
+    COL_DESC      = 3  # C
+    COL_BRAND     = 4  # D
+    COL_MATERIAL  = 5  # E
+    COL_WEIGHT    = 6  # F
+    COL_QTY_CT    = 7  # G
 
-    def col(name: str) -> int:
-        try:
-            return header.index(name) + 1
-        except ValueError:
-            raise RuntimeError(f"Column '{name}' not found in header of sheet '{ws.title}'")
+    HEADER_ROW = 1  # data starts below this
 
+    # ===== read images (optional) =====
     img_at = {}
     for img in ws._images:
         try:
             r = img.anchor._from.row + 1
             c = img.anchor._from.col + 1
             img_at[(r, c)] = img._data()
-        except Exception as e:
-            print("⚠️ Cannot read an image in catalog:", e)
+        except Exception:
+            pass
 
-    pic_col = col("GOODS PICTURE")
-
+    # ===== build catalog map =====
     catalog = {}
-    for r in range(header_row + 1, ws.max_row + 1):
-        item_no = ws.cell(r, col("BUYER ITEM NO.")).value
+
+    for r in range(HEADER_ROW + 1, ws.max_row + 1):
+        item_no = ws.cell(r, COL_ITEM_NO).value
         if not item_no:
             continue
+
         item_no = str(item_no).strip()
+
         catalog[item_no] = {
-            "goods_desc": ws.cell(r, col("GOODS DESCRIPTION")).value,
-            "brand": ws.cell(r, col("BRAND")).value,
-            "material": ws.cell(r, col("MATERIAL")).value,
-            "weight": ws.cell(r, col("Weight")).value,
-            "qty_per_carton": ws.cell(r, col("QTY PER CARTON")).value,
-            "img_bytes": img_at.get((r, pic_col)),
+            "goods_desc": ws.cell(r, COL_DESC).value,
+            "brand": ws.cell(r, COL_BRAND).value,
+            "material": ws.cell(r, COL_MATERIAL).value,
+            "weight": ws.cell(r, COL_WEIGHT).value,
+            "qty_per_carton": ws.cell(r, COL_QTY_CT).value,
+            "img_bytes": img_at.get((r, COL_PICTURE)),
         }
 
-    print(f">>> Catalog loaded from sheet '{ws.title}': {len(catalog)} items, {len(img_at)} images")
+    print(f">>> Catalog loaded from sheet '{ws.title}': {len(catalog)} items")
     return catalog
 
 
@@ -854,7 +868,8 @@ def generate_po_from_combined(
 
     catalog_map = {}
     if os.path.exists(catalog_path):
-        catalog_map = build_catalog_map(catalog_path, vendor_code=vendor_code, header_row=1)
+        catalog_map = build_catalog_map(catalog_path, vendor_code=vendor_code)
+
     else:
         print(f"⚠️ Catalog not found: {catalog_path}")
 
