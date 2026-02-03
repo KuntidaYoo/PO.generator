@@ -809,4 +809,508 @@ def paste_total_block_and_fix(
     ws[f"O{r1}"].value = None
     ws[f"O{r2}"].value = None
 
-    ws[f"N{r1}
+    ws[f"N{r1}"].value = f"=SUM({col_amt}{item_start_row}:{col_amt}{last_item_row})"
+    ws[f"N{r_mid}"].value = rate_thb_per_cny
+    ws[f"N{r2}"].value = f"=N{r_mid}*N{r1}"
+
+
+def find_label_cell(ws, label: str, max_row: int = 60, max_col: int = 30):
+    target = norm_text(label)
+    for r in range(1, min(max_row, ws.max_row) + 1):
+        for c in range(1, min(max_col, ws.max_column) + 1):
+            if norm_text(ws.cell(r, c).value) == target:
+                return r, c
+    return None
+
+
+# =========================
+# Generate PO
+# =========================
+def generate_po_from_combined(
+    combined_df: pd.DataFrame,
+    vendor_code: str,
+    po_date: Optional[datetime.date] = None,
+    rate_thb_per_cny: float = 6.0,
+    template_path: str = TEMPLATE_PO_XLSX,
+    catalog_path: str = CATALOG_XLSX,
+    vendor_info_path: str = VENDOR_INFO_XLSX,
+    min_factor: int = 4,
+    max_factor: int = 7,
+) -> str:
+
+    if po_date is None:
+        po_date = datetime.date.today()
+
+    os.makedirs(PO_OUTPUT_FOLDER, exist_ok=True)
+    output_path = os.path.join(PO_OUTPUT_FOLDER, f"PO_{vendor_code}.xlsx")
+
+    vendor_key = str(vendor_code).strip().upper()
+
+    vendor_map_raw = load_vendor_map(vendor_info_path)
+    vendor_map = {str(k).strip().upper(): v for k, v in vendor_map_raw.items()}
+
+    supplier_name = vendor_map.get(vendor_key, {}).get("name", "")
+    supplier_addr = vendor_map.get(vendor_key, {}).get("address", "")
+
+    catalog_map = {}
+    if os.path.exists(catalog_path):
+        catalog_map = build_catalog_map(catalog_path, vendor_code=vendor_code, header_row=1)
+    else:
+        print(f"⚠️ Catalog not found: {catalog_path}")
+
+    wb = openpyxl.load_workbook(template_path)
+    template_ws = wb[TEMPLATE_SHEET_NAME]
+    ws = wb.copy_worksheet(template_ws)
+    ws.title = "PO"
+
+    copy_column_widths(template_ws, ws)
+    ws.column_dimensions["B"].width = (ws.column_dimensions["B"].width or 18) + 6
+
+    po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
+
+    def _find_col_key(possible_keys):
+        for k in possible_keys:
+            if k in po_cols:
+                return k
+        return None
+
+    min_key_old = _find_col_key(["MIN*4", "MIN * 4", "MIN×4", "MIN x4", "MINX4"])
+    max_key_old = _find_col_key(["MAX*7", "MAX * 7", "MAX×7", "MAX x7", "MAXX7"])
+
+    if not min_key_old or not max_key_old:
+        raise RuntimeError(f"Cannot find MIN/MAX header in template.")
+
+    min_col_idx = po_cols[min_key_old]
+    max_col_idx = po_cols[max_key_old]
+
+    ws.cell(HEADER_ROW, min_col_idx).value = f"MIN*{int(min_factor)}"
+    ws.cell(HEADER_ROW, max_col_idx).value = f"MAX*{int(max_factor)}"
+
+    col_min = get_column_letter(min_col_idx)
+    col_max = get_column_letter(max_col_idx)
+
+    PO_LAST_COL = max(po_cols.values())
+
+    col_cart = get_column_letter(po_cols["CARTONS"])
+    col_tot_order = get_column_letter(po_cols["TOTAL QTY (ORDER)"])
+    col_amt = get_column_letter(po_cols["AMOUNT (CNY)"])
+    col_thb = get_column_letter(po_cols["THB"])
+
+    ws["H6"] = vendor_code
+    ws["H6"].font = Font(color="FF0000", bold=True, size=18)
+
+    pos = find_label_cell(ws, "DATE", max_row=20, max_col=30)
+    if pos:
+        r, c = pos
+        ws.cell(r, c + 1).value = po_date
+
+    pos = find_label_cell(ws, "SUPPLIER", max_row=20, max_col=30)
+    if pos and supplier_name:
+        r, c = pos
+        ws.cell(r, c + 1).value = supplier_name
+
+    pos = find_label_cell(ws, "ADDRESS", max_row=25, max_col=30)
+    if pos and supplier_addr:
+        r, c = pos
+        ws.cell(r, c + 1).value = supplier_addr
+
+    if os.path.exists("logo.png"):
+        logo_img = XLImage("logo.png")
+        logo_img.width = 210
+        logo_img.height = 110
+        ws.add_image(logo_img, "A1")
+
+    combined_df = (
+        combined_df.sort_values(by=["รหัสสินค้า", "รายละเอียดสินค้า"], ascending=[True, True])
+        .reset_index(drop=True)
+    )
+
+    current_row = ITEM_START_ROW
+
+    for _, row in combined_df.iterrows():
+        line = current_row
+        current_row += 1
+
+        copy_row_style(ws, TEMPLATE_ITEM_ROW, line, PO_LAST_COL)
+        copy_row_height(ws, TEMPLATE_ITEM_ROW, line)
+
+        buyer_item = str(row["รหัสสินค้า"]).strip()
+        cat = catalog_map.get(buyer_item, {})
+
+        qty_per_carton = cat.get("qty_per_carton", "")
+        try:
+            qty_per_carton_num = float(qty_per_carton) if qty_per_carton not in [None, ""] else 0.0
+        except:
+            qty_per_carton_num = 0.0
+
+        use_month = int(row["USE_MONTH"]) if not pd.isna(row["USE_MONTH"]) else 0
+        total_qty_num = float(row["TOTAL_QTY_NUM"])
+        max_num = float(row["MAX_NUM"])
+        units_to_order = max_num - total_qty_num
+        if units_to_order < 0:
+            units_to_order = 0
+
+        yuan = row["หยวน"] if not pd.isna(row["หยวน"]) else None
+        try:
+            yuan_num = float(yuan) if yuan is not None else None
+        except:
+            yuan_num = None
+
+        ws.cell(line, po_cols["BUYER ITEM NO."]).value = buyer_item
+
+        if cat.get("img_bytes"):
+            add_image_to_cell(ws, f"B{line}", cat["img_bytes"])
+
+        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = cat.get("goods_desc", row.get("รายละเอียดสินค้า", ""))
+        ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
+        ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
+        ws.cell(line, po_cols["Weight"]).value = cat.get("weight", "")
+        ws.cell(line, po_cols["QTY PER CARTON"]).value = qty_per_carton_num if qty_per_carton_num > 0 else None
+
+        ws.cell(line, po_cols["STOCK GREEN"]).value = float(row["STOCK_GREEN"])
+        ws.cell(line, po_cols["STOCK ASIA"]).value = float(row["STOCK_ASIA"])
+        ws.cell(line, po_cols["ON ORDER"]).value = float(row["ON_ORDER_TOTAL"])
+        ws.cell(line, po_cols["USE MONTH"]).value = use_month
+
+        col_use = get_column_letter(po_cols["USE MONTH"])
+        col_sg = get_column_letter(po_cols["STOCK GREEN"])
+        col_sa = get_column_letter(po_cols["STOCK ASIA"])
+        col_on = get_column_letter(po_cols["ON ORDER"])
+        col_tq = get_column_letter(po_cols["TOTAL QTY"])
+        col_zan = get_column_letter(po_cols["จน./USE MONTH"])
+        col_remain0 = get_column_letter(po_cols["คงเหลือ (จน./USE MONTH เดิม)"])
+        col_qpc = get_column_letter(po_cols["QTY PER CARTON"])
+        col_green = get_column_letter(po_cols["GREEN"])
+        col_asia = get_column_letter(po_cols["ASIA"])
+        col_fob = get_column_letter(po_cols["FOB PRICE (CNY)"])
+
+        ws[f"{col_min}{line}"] = f"={col_use}{line}*{int(min_factor)}"
+        ws[f"{col_max}{line}"] = f"={col_use}{line}*{int(max_factor)}"
+
+        ws[f"{col_tq}{line}"] = f"={col_sg}{line}+{col_sa}{line}+{col_on}{line}"
+        ws[f"{col_zan}{line}"] = f"=ROUND(({col_tq}{line}+{col_tot_order}{line})/{col_use}{line},0)"
+        ws[f"{col_remain0}{line}"] = f"=ROUND({col_tq}{line}/{col_use}{line},0)"
+
+        ws[f"{col_cart}{line}"] = f"=ROUND(({col_max}{line}-{col_tq}{line})/{col_qpc}{line},0)"
+        ws[f"{col_green}{line}"] = f"={col_cart}{line}*{col_qpc}{line}"
+        ws[f"{col_asia}{line}"] = 0
+        ws[f"{col_tot_order}{line}"] = f"={col_green}{line}+{col_asia}{line}"
+
+        if yuan_num is not None:
+            ws[f"{col_fob}{line}"] = yuan_num
+            ws[f"{col_thb}{line}"] = yuan_num * rate_thb_per_cny
+        else:
+            ws[f"{col_fob}{line}"] = None
+            ws[f"{col_thb}{line}"] = None
+
+        ws[f"{col_amt}{line}"] = f"={col_fob}{line}*{col_tot_order}{line}"
+
+    if len(combined_df) > 0:
+        last_item_row = ITEM_START_ROW + len(combined_df) - 1
+        force_bottom_border(ws, last_item_row, 1, PO_LAST_COL)
+
+        total_block_start = last_item_row + 1
+        paste_total_block_and_fix(
+            ws=ws,
+            template_ws=template_ws,
+            total_block_start=total_block_start,
+            po_last_col=PO_LAST_COL,
+            item_start_row=ITEM_START_ROW,
+            last_item_row=last_item_row,
+            col_amt=col_amt,
+            rate_thb_per_cny=rate_thb_per_cny,
+        )
+
+        total_block_end = total_block_start + 2
+        add_signature_under_last_item(
+            ws,
+            last_item_row=total_block_end,
+            sig_path="footer_signatures.png",
+            gap_rows=4,
+            anchor_col="A",
+        )
+
+    wb.remove(template_ws)
+    wb.save(output_path)
+    print(f"✔ PO created: {output_path}")
+    return output_path
+
+HIGHLIGHT_BELOW_MIN = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")  # light yellow
+
+def generate_po_streamlit(
+    express_asia_path: str,
+    express_green_path: str,
+    catalog_path: str,
+    vendor_info_path: str,
+    template_path: str,
+    vendor_code: str,
+    po_date,
+    rate_thb_per_cny: float,
+    min_factor: int = 4,
+    max_factor: int = 7,
+) -> dict:
+    """
+    Returns dict:
+      {
+        "po_filtered": <path or None>,
+        "po_all_items": <path always>,
+        "count_all": int,
+        "count_filtered": int
+      }
+    """
+    vendor_code = str(vendor_code).strip().upper()
+
+    # 1) parse each file
+    df_asia, date_info_asia = parse_express_file(express_asia_path, "ASIA")
+    df_green, date_info_green = parse_express_file(express_green_path, "GREEN")
+
+    for df in (df_asia, df_green):
+        if not df.empty and "buyer" in df.columns:
+            df["buyer"] = df["buyer"].astype(str).str.replace("\u00A0", " ", regex=False).str.strip().str.upper()
+
+    # 2) choose months
+    months = 1
+    if date_info_asia and date_info_asia.get("months", 0) > 0:
+        months = int(date_info_asia["months"])
+    elif date_info_green and date_info_green.get("months", 0) > 0:
+        months = int(date_info_green["months"])
+
+    # 3) Build combined_all (no filter) using same logic
+    def _agg_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
+        key_cols = ["buyer", "รหัสสินค้า"]
+        if df.empty:
+            return pd.DataFrame(columns=key_cols + [
+                f"ยอดขาย_{label}", f"STOCK_{label}", f"ON_ORDER_{label}", f"หยวน_{label}",
+                "barcode", "รายละเอียดสินค้า"
+            ])
+        g = df.groupby(key_cols, as_index=False).agg({
+            "ยอดขาย": "sum",
+            "สินค้าคงเหลือ": "sum",
+            "ON_ORDER": "sum",
+            "หยวน": "first",
+            "barcode": "first",
+            "รายละเอียดสินค้า": "first",
+        })
+        return g.rename(columns={
+            "ยอดขาย": f"ยอดขาย_{label}",
+            "สินค้าคงเหลือ": f"STOCK_{label}",
+            "ON_ORDER": f"ON_ORDER_{label}",
+            "หยวน": f"หยวน_{label}",
+        })
+
+    g_asia = _agg_df(df_asia, "ASIA")
+    g_green = _agg_df(df_green, "GREEN")
+
+    combined_all = pd.merge(g_asia, g_green, on=["buyer", "รหัสสินค้า"], how="outer", suffixes=("", "_dup"))
+
+    def _coalesce(a, b):
+        return a if pd.notna(a) and a != "" else b
+
+    combined_all["barcode"] = [
+        _coalesce(a, b) for a, b in zip(
+            combined_all.get("barcode_x", [None] * len(combined_all)),
+            combined_all.get("barcode_y", [None] * len(combined_all)),
+        )
+    ]
+    combined_all["รายละเอียดสินค้า"] = [
+        _coalesce(a, b) for a, b in zip(
+            combined_all.get("รายละเอียดสินค้า_x", [None] * len(combined_all)),
+            combined_all.get("รายละเอียดสินค้า_y", [None] * len(combined_all)),
+        )
+    ]
+    for col in ["barcode_x", "barcode_y", "รายละเอียดสินค้า_x", "รายละเอียดสินค้า_y"]:
+        if col in combined_all.columns:
+            combined_all.drop(columns=[col], inplace=True)
+
+    for col in ["ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA",
+                "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN"]:
+        if col not in combined_all.columns:
+            combined_all[col] = 0.0
+        else:
+            combined_all[col] = combined_all[col].fillna(0.0)
+
+    combined_all["ยอดขาย_TOTAL"] = combined_all["ยอดขาย_ASIA"] + combined_all["ยอดขาย_GREEN"]
+    combined_all["ON_ORDER_TOTAL"] = combined_all["ON_ORDER_ASIA"] + combined_all["ON_ORDER_GREEN"]
+
+    def _pick_yuan(row):
+        yG = row.get("หยวน_GREEN", np.nan)
+        yA = row.get("หยวน_ASIA", np.nan)
+        if pd.notna(yG):
+            return float(yG)
+        if pd.notna(yA):
+            return float(yA)
+        return np.nan
+
+    combined_all["หยวน"] = combined_all.apply(_pick_yuan, axis=1)
+
+    if months <= 0:
+        months = 1
+
+    combined_all["USE_MONTH"] = combined_all["ยอดขาย_TOTAL"].apply(
+        lambda v: round_half_up(v / months) if v > 0 else 0
+    )
+    combined_all["TOTAL_QTY_NUM"] = combined_all["STOCK_ASIA"] + combined_all["STOCK_GREEN"] + combined_all["ON_ORDER_TOTAL"]
+    combined_all["MIN_NUM"] = combined_all["USE_MONTH"] * int(min_factor)
+    combined_all["MAX_NUM"] = combined_all["USE_MONTH"] * int(max_factor)
+
+    # vendor rows ALL (no filter)
+    vendor_rows_all = combined_all[combined_all["buyer"] == vendor_code].copy()
+    if vendor_rows_all.empty:
+        buyers = sorted(set(combined_all["buyer"].dropna().astype(str).tolist()))
+        preview = ", ".join(buyers[:30])
+        raise ValueError(f"Vendor '{vendor_code}' not found. Parsed buyers (first 30): {preview}")
+
+    # Export ALL items file (always)
+    path_all = export_vendor_all_items_excel(vendor_rows_all, vendor_code=vendor_code)
+
+    # vendor rows FILTERED (below MIN)
+    vendor_rows_filtered = vendor_rows_all[vendor_rows_all["TOTAL_QTY_NUM"] < vendor_rows_all["MIN_NUM"]].copy()
+
+    path_filtered = None
+    if not vendor_rows_filtered.empty:
+        path_filtered = generate_po_from_combined(
+            combined_df=vendor_rows_filtered,
+            vendor_code=vendor_code,
+            po_date=po_date,
+            rate_thb_per_cny=float(rate_thb_per_cny),
+            template_path=template_path,
+            catalog_path=catalog_path,
+            vendor_info_path=vendor_info_path,
+            min_factor=int(min_factor),
+            max_factor=int(max_factor),
+        )
+
+    return {
+        "po_filtered": path_filtered,
+        "po_all_items": path_all,
+        "count_all": int(len(vendor_rows_all)),
+        "count_filtered": int(len(vendor_rows_filtered)),
+    }
+
+def export_vendor_all_items_excel(
+    vendor_rows_all: pd.DataFrame,
+    vendor_code: str,
+    out_folder: str = PO_OUTPUT_FOLDER,
+) -> str:
+    """
+    Export ALL items for the vendor (no MIN filter) into Excel.
+    Highlight rows where TOTAL_QTY_NUM < MIN_NUM.
+    """
+    os.makedirs(out_folder, exist_ok=True)
+    vendor_code = str(vendor_code).strip().upper()
+    out_path = os.path.join(out_folder, f"PO_{vendor_code}_ALL_ITEMS.xlsx")
+
+    cols_wanted = [
+        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "barcode",
+        "ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA", "หยวน_ASIA",
+        "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN", "หยวน_GREEN",
+        "ยอดขาย_TOTAL", "ON_ORDER_TOTAL",
+        "USE_MONTH", "TOTAL_QTY_NUM", "MIN_NUM", "MAX_NUM", "หยวน",
+    ]
+    cols = [c for c in cols_wanted if c in vendor_rows_all.columns]
+
+    df_out = vendor_rows_all.copy()
+
+    # Sort like PO
+    if "รหัสสินค้า" in df_out.columns and "รายละเอียดสินค้า" in df_out.columns:
+        df_out = df_out.sort_values(["รหัสสินค้า", "รายละเอียดสินค้า"], ascending=[True, True])
+
+    # Write with pandas first
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_out[cols].to_excel(writer, sheet_name="all_items", index=False)
+
+    # Re-open and highlight rows below MIN
+    wb = openpyxl.load_workbook(out_path)
+    ws = wb["all_items"]
+
+    # Find the column indexes of TOTAL_QTY_NUM and MIN_NUM from header row 1
+    header = {str(ws.cell(1, c).value).strip(): c for c in range(1, ws.max_column + 1)}
+
+    if "TOTAL_QTY_NUM" not in header or "MIN_NUM" not in header:
+        wb.save(out_path)
+        return out_path
+
+    col_total = header["TOTAL_QTY_NUM"]
+    col_min = header["MIN_NUM"]
+
+    # Apply fill for rows where total < min
+    for r in range(2, ws.max_row + 1):
+        total_v = ws.cell(r, col_total).value
+        min_v = ws.cell(r, col_min).value
+
+        try:
+            total_f = float(total_v) if total_v is not None else None
+            min_f = float(min_v) if min_v is not None else None
+        except Exception:
+            continue
+
+        if total_f is not None and min_f is not None and total_f < min_f:
+            for c in range(1, ws.max_column + 1):
+                ws.cell(r, c).fill = HIGHLIGHT_BELOW_MIN
+
+    wb.save(out_path)
+    return out_path
+
+# =========================
+# MAIN
+# =========================
+def main():
+    df_asia = pd.DataFrame()
+    df_green = pd.DataFrame()
+    months_global = None
+
+    for path, label in EXPRESS_FILES:
+        if not os.path.exists(path):
+            print(f"⚠️ File not found, skipping: {path}")
+            continue
+
+        df_raw = pd.read_excel(path, sheet_name=EXPRESS_SHEET, header=None, dtype=str)
+        date_info = parse_date_range_from_header(df_raw)
+        months = date_info["months"] if date_info["months"] > 0 else 1
+
+        if months_global is None:
+            months_global = months
+        elif months_global != months:
+            print(f"⚠️ Months differ between files, using {months_global}")
+
+        df_tmp, _ = parse_express_file(path, label)
+        if label == "ASIA":
+            df_asia = df_tmp
+        else:
+            df_green = df_tmp
+
+    if months_global is None:
+        months_global = 1
+
+    print(f">>> Months used for USE_MONTH: {months_global}")
+    combined = combine_asia_green(df_asia, df_green, months=months_global)
+
+    vendor = input("กรุณาระบุรหัส Vendor เช่น A0029: ").strip()
+    if not vendor:
+        print("ไม่ได้ระบุ Vendor code, stop.")
+        return
+
+    date_str = input("ระบุวันที่ PO (รูปแบบ YYYY-MM-DD, ว่าง = วันนี้): ").strip()
+    if date_str:
+        try:
+            po_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            print("รูปแบบวันที่ไม่ถูกต้อง ใช้วันที่วันนี้แทน")
+            po_date = datetime.date.today()
+    else:
+        po_date = datetime.date.today()
+
+    vendor_combined = combined[combined["buyer"] == vendor].copy()
+    if vendor_combined.empty:
+        print(f"⚠️ No rows after filter for vendor {vendor}")
+        return
+
+    generate_po_from_combined(
+        combined_df=vendor_combined,
+        vendor_code=vendor,
+        po_date=po_date,
+        rate_thb_per_cny=6.0,
+    )
+
+if __name__ == "__main__":
+    main()
