@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import openpyxl
 from PIL import Image as PILImage
+
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Border, Side, PatternFill
@@ -122,19 +123,6 @@ def parse_date_range_from_header(df_raw: pd.DataFrame) -> Dict[str, object]:
         return {"raw_line": text, "start_date": start_date, "end_date": end_date, "days": days, "months": months}
     return {"raw_line": "", "start_date": None, "end_date": None, "days": 0, "months": 1}
 
-def _tail_after_last_thai(text: str) -> str:
-    """
-    Return substring after the last Thai character.
-    This isolates the numeric tail and avoids grabbing numbers from doc tokens like 20-01-0003-E1-1.
-    """
-    if not text:
-        return ""
-    m_all = list(re.finditer(r"[\u0E00-\u0E7F]", text))
-    if not m_all:
-        # no Thai found: fallback to full string
-        return text
-    last_thai = m_all[-1].end()
-    return text[last_thai:].strip()
 
 # =========================
 # SMALL UTILS
@@ -178,18 +166,15 @@ def fix_split_numbers_in_line(line: str) -> str:
     return " ".join(tokens)
 
 
-def row_to_primary_text(row: pd.Series) -> str:
+def row_to_merged_line(row: pd.Series) -> str:
     """
-    Prefer the first cell as parsing source (your guarantee: numeric block is in the first cell).
-    Fallback to concatenation only if first cell is empty.
+    Merge all non-empty cells for robust parsing of buyer/product text.
+    (We do NOT rely on merging for yuan; yuan is found by scanning row cells.)
     """
-    first = clean_cell(row.iloc[0]) if len(row) else ""
-    if first:
-        return fix_split_numbers_in_line(first)
-
     cells = [clean_cell(v) for v in row.tolist()]
     cells = [c for c in cells if c]
-    return fix_split_numbers_in_line(" ".join(cells).strip())
+    raw = " ".join(cells).strip()
+    return fix_split_numbers_in_line(raw)
 
 
 def looks_like_buyer_code(token: str) -> bool:
@@ -223,9 +208,10 @@ def split_product_field(s: str) -> Tuple[str, str]:
     """
     Split merged product string into (product_code, description).
 
-    Requirements you stated:
-    - Ignore doc tokens like 01-24-2624 (document/txn token) so code becomes D-4120
-    - Support codes like D-4120, DGS-2318, MC401-18, BM-150, NoBM-150
+    Supports:
+      - doc token like 01-15-0730-D3-5 (ignore)
+      - codes like NR123-60, DGS-2318, MC401-18, BM-150, NRW, etc
+      - NoBM-150 => BM-150
     """
     if not isinstance(s, str):
         return "", ""
@@ -234,7 +220,6 @@ def split_product_field(s: str) -> Tuple[str, str]:
         return "", ""
 
     s = s.translate(_DASH_TRANS)
-
     parts = s.split(maxsplit=1)
     if len(parts) < 2:
         return "", ""
@@ -254,6 +239,8 @@ def split_product_field(s: str) -> Tuple[str, str]:
         if re.fullmatch(r"[A-Za-z]{1,6}[A-Za-z0-9]*-[A-Za-z0-9]+", t2):
             return True
         if re.fullmatch(r"[A-Za-z]{1,6}\d+[A-Za-z0-9]*", t2):
+            return True
+        if re.fullmatch(r"[A-Za-z]{2,5}", t2):  # e.g. NRW
             return True
         return False
 
@@ -299,158 +286,127 @@ def split_product_field(s: str) -> Tuple[str, str]:
 
 
 # =========================
-# NUMERIC PARSING (FIX)
+# MONEY BLOCK + 5/6 NUMBERS
 # =========================
-def extract_numeric_tail_from_row(row: pd.Series, scan_cols: int = 12) -> List[float]:
-    """
-    Reconstruct numeric tail from a row where money values may be split across cells.
-
-    Rules:
-    - Scan left → right across first `scan_cols` cells
-    - Stitch adjacent numeric fragments until they form X.XX
-    - Valid numbers MUST end with exactly 2 decimal places
-    - Return at most the last 6 valid numbers
-    """
-    fragments: List[str] = []
-
-    # Step 1: collect numeric-looking fragments from cells
-    for i in range(min(scan_cols, len(row))):
-        cell = row.iloc[i]
-        if pd.isna(cell):
-            continue
-
-        s = str(cell).replace("\xa0", " ").strip()
-        if not s:
-            continue
-
-        # Extract rough numeric tokens (even incomplete)
-        tokens = re.findall(r"-?\d+(?:,\d{3})*\.?\d*", s)
-        fragments.extend(tokens)
-
-    # Step 2: stitch fragments into valid 2dp money numbers
-    numbers: List[float] = []
-    carry = ""
-
-    def is_valid_money(x: str) -> bool:
-        return bool(re.fullmatch(r"-?\d+(?:,\d{3})*\.\d{2}", x))
-
-    for frag in fragments:
-        frag = frag.replace(",", "")
-
-        if not carry:
-            carry = frag
-        else:
-            # Try stitching
-            carry = carry + frag
-
-        if is_valid_money(carry):
-            try:
-                numbers.append(float(carry))
-            except Exception:
-                pass
-            carry = ""
-
-            # Stop early if we already have 6
-            if len(numbers) >= 6:
-                break
-        else:
-            # If carry grows too long and still invalid → reset
-            if len(carry) > 20:
-                carry = ""
-
-    # Step 3: return only the last 5–6 numbers (your logic expects this)
-    if len(numbers) >= 6:
-        return numbers[-6:]
-    if len(numbers) >= 5:
-        return numbers[-5:]
-    return []
+_MONEY_2DP_RE = re.compile(r"-?\d+(?:,\d{3})*\.\d{2}")
+_YUAN_RE = re.compile(r"^[Yy]?\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
-def _extract_money_numbers_2dp(text: str) -> List[float]:
-    """
-    Extract numbers that have exactly 2 decimal places.
-    Accepts commas: 6,496.00
-    """
-    if not text:
-        return []
-
-    patt = re.compile(r"-?\d{1,3}(?:,\d{3})*\.\d{2}|-?\d+\.\d{2}")
+def _money_tokens_2dp_in_text(s: str) -> List[float]:
     out: List[float] = []
-    for raw in patt.findall(text):
-        s = raw.replace(",", "").strip()
+    if not s:
+        return out
+    for raw in _MONEY_2DP_RE.findall(s):
         try:
-            out.append(float(s))
+            out.append(float(raw.replace(",", "")))
         except Exception:
             pass
     return out
 
 
-def _pick_yuan_from_numbers(nums: List[float]) -> Optional[float]:
+def extract_money_2dp_numbers_from_row(row: pd.Series, scan_cols: int = 25) -> List[float]:
     """
-    Yuan is a price-like decimal number near the end.
-    Keep it separate so it doesn't shift the 5/6 block.
-
-    If your dataset has a better rule later, adjust here only.
+    Extract 2dp money numbers from the first `scan_cols` columns (left area).
+    Keeps the order left->right.
     """
-    if not nums:
-        return None
-    tail = nums[-12:]
-    candidates = []
-    for v in tail:
+    out: List[float] = []
+    for i in range(min(scan_cols, len(row))):
+        v = row.iloc[i]
         if v is None:
             continue
-        if abs(v) < 5000 and abs(v) != int(abs(v)):
-            candidates.append(v)
-    return candidates[-1] if candidates else None
+        s = str(v).replace("\xa0", " ").strip()
+        if not s:
+            continue
+        out.extend(_money_tokens_2dp_in_text(s))
+    return out
 
 
-def parse_primary_cell_numeric_block(primary_text: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def find_money_block_cell(row: pd.Series, min_tokens: int = 3) -> int:
     """
-    Parse (sale, stock, on_order, yuan) from the numeric tail ONLY.
-
-    Assumptions:
-      - Relevant numeric tail values are exactly 2dp
-      - Tail block is either 6 numbers or 5 numbers
-      - ON_ORDER is last number of the block
-      - If 6 numbers: sale position = 3rd (index 2), stock position = 4th (index 3)
-      - If 5 numbers: no sale -> sale = 0, stock position = 3rd (index 2)
-      - yuan is handled separately (but still comes from same 2dp list)
+    Return money_block_cell_index (0-based) where a single cell contains >= min_tokens money 2dp tokens.
+    If none found, return -1.
     """
-    nums = extract_numeric_tail_from_row(row, scan_cols=12)
-
-    if len(nums) < 5:
-        return None, None, None, None
-
-    block = nums[-6:] if len(nums) >= 6 else nums[-5:]
-
-    # yuan detection (keep it simple since everything is 2dp)
-    yuan_val = None
-    # your yuan is usually a "small-ish" price; tweak threshold if needed
-    for v in reversed(nums):
-        if 0 < v < 5000:
-            yuan_val = float(v)
-            break
-
-    if len(block) == 6:
-        sale = float(block[2])
-        stock = float(block[3])
-        on_order = float(block[5])
-    else:
-        sale = 0.0
-        stock = float(block[2])
-        on_order = float(block[4])
-
-    return sale, stock, on_order, yuan_val
+    for i in range(len(row)):
+        v = row.iloc[i]
+        if v is None:
+            continue
+        s = str(v).replace("\xa0", " ").strip()
+        if not s:
+            continue
+        if len(_MONEY_2DP_RE.findall(s)) >= min_tokens:
+            return i
+    return -1
 
 
-
-def parse_line_primary(row: pd.Series, primary_text: str) -> Optional[Dict[str, object]]:
+def parse_yuan_value(v) -> Optional[float]:
     """
-    Parse one Express row from primary cell text:
-      buyer(5 chars) + barcode(optional) + product field + numeric tail (5 or 6 nums).
-    Now supports numeric tail split across multiple cells using `extract_numeric_tail_from_row`.
+    Accept:
+      - 7.98
+      - Y7.98 / Y 7.98
+    Reject:
+      - % values
+      - junk text
+      - 0 / 0.00
     """
-    m = re.match(r"\s*([0-9A-Za-z]{5})\b(.*)", primary_text or "")
+    if v is None:
+        return None
+    s = str(v).replace("\xa0", " ").strip()
+    if not s:
+        return None
+    if "%" in s:
+        return None
+
+    m = _YUAN_RE.match(s)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except Exception:
+        return None
+    if abs(val) < 1e-12:
+        return None
+    return val
+
+
+def extract_yuan_after_money_block(row: pd.Series, lookahead_cells: int = 20) -> Optional[float]:
+    """
+    FINAL RULE YOU CONFIRMED:
+      - locate money-block cell (contains many 2dp numbers)
+      - scan next 15-20 cells to the right
+      - the first valid numeric cell there is yuan
+      - if none -> None
+    """
+    money_idx = find_money_block_cell(row, min_tokens=3)
+    if money_idx < 0:
+        return None
+
+    start = money_idx + 1
+    end = min(len(row), money_idx + 1 + int(lookahead_cells))
+
+    for j in range(start, end):
+        v = row.iloc[j]
+        if v is None:
+            continue
+        s = str(v).replace("\xa0", " ").strip()
+        if not s:
+            continue
+        y = parse_yuan_value(s)
+        if y is not None:
+            return y
+    return None
+
+
+# =========================
+# PARSE ONE LINE -> FIELDS
+# =========================
+def parse_line_to_fields(row: pd.Series, merged_line: str) -> Optional[Dict[str, object]]:
+    """
+    Parse an Express row into:
+      buyer, barcode(optional), สินค้า(product_str), ยอดขาย, สินค้าคงเหลือ, ON_ORDER, หยวน
+    The 5/6-number block is extracted from row (2dp tokens).
+    Yuan is extracted by money-block anchor + lookahead scan.
+    """
+    m = re.match(r"\s*([0-9A-Za-z]{5})\b(.*)", merged_line or "")
     if not m:
         return None
 
@@ -473,25 +429,15 @@ def parse_line_primary(row: pd.Series, primary_text: str) -> Optional[Dict[str, 
     if not product_str:
         return None
 
-    # --- NEW: numeric tail from row (handles split cells) ---
-    nums = extract_numeric_tail_from_row(row, scan_cols=12)
-
-    # Fallback: old behavior (from primary text only)
-    if not nums:
-        tail_text = _tail_after_last_thai(primary_text)
-        nums = _extract_money_numbers_2dp(tail_text)
-
+    nums = extract_money_2dp_numbers_from_row(row, scan_cols=25)
     if len(nums) < 5:
         return None
 
     block = nums[-6:] if len(nums) >= 6 else nums[-5:]
 
-    yuan_val = None
-    for v in reversed(nums):
-        if 0 < v < 5000:
-            yuan_val = float(v)
-            break
-
+    # your old mapping:
+    # if 6 numbers: sale=block[2], stock=block[3], on_order=block[5]
+    # if 5 numbers: sale=0, stock=block[2], on_order=block[4]
     if len(block) == 6:
         sale = float(block[2])
         stock = float(block[3])
@@ -501,16 +447,17 @@ def parse_line_primary(row: pd.Series, primary_text: str) -> Optional[Dict[str, 
         stock = float(block[2])
         on_order = float(block[4])
 
+    yuan_val = extract_yuan_after_money_block(row, lookahead_cells=20)
+
     return {
         "buyer": buyer,
         "barcode": barcode,
         "สินค้า": product_str,
-        "ยอดขาย": float(sale) if sale is not None else 0.0,
-        "สินค้าคงเหลือ": float(stock),
-        "ON_ORDER": float(on_order),
+        "ยอดขาย": sale,
+        "สินค้าคงเหลือ": stock,
+        "ON_ORDER": on_order,
         "หยวน": yuan_val,
     }
-
 
 
 def parse_express_file(path: str, source_label: str) -> Tuple[pd.DataFrame, Dict[str, object]]:
@@ -523,18 +470,17 @@ def parse_express_file(path: str, source_label: str) -> Tuple[pd.DataFrame, Dict
 
     rows = []
     for idx, row in df_raw.iterrows():
-        primary = row_to_primary_text(row)
-        if not primary:
+        merged = row_to_merged_line(row)
+        if not merged:
             continue
-        if is_header_or_separator(primary):
+        if is_header_or_separator(merged):
             continue
 
-        first_token = primary.split(maxsplit=1)[0] if primary.split() else ""
+        first_token = merged.split(maxsplit=1)[0] if merged.split() else ""
         if not looks_like_buyer_code(first_token):
             continue
 
-        fields = parse_line_primary(row, primary)
-
+        fields = parse_line_to_fields(row, merged)
         if fields is None:
             continue
 
@@ -619,9 +565,15 @@ def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: in
         yG = row.get("หยวน_GREEN", np.nan)
         yA = row.get("หยวน_ASIA", np.nan)
         if pd.notna(yG):
-            return float(yG)
+            try:
+                return float(yG)
+            except Exception:
+                return np.nan
         if pd.notna(yA):
-            return float(yA)
+            try:
+                return float(yA)
+            except Exception:
+                return np.nan
         return np.nan
 
     combined["หยวน"] = combined.apply(pick_yuan, axis=1)
