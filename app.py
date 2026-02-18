@@ -2,8 +2,16 @@ import streamlit as st
 import datetime
 import tempfile
 from pathlib import Path
-
+from openpyxl import Workbook
 import main
+
+def make_empty_express_xlsx(path: Path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "BUYER"  # harmless header so parser finds nothing
+    wb.save(path)
+
 
 st.set_page_config(page_title="PO generator", layout="centered")
 
@@ -38,8 +46,8 @@ if btn:
         st.error("กรุณาใส่รหัส Supplier")
         st.stop()
 
-    if up_express_asia is None or up_express_green is None or up_catalog is None or up_vendorinfo is None:
-        st.error("กรุณาอัปโหลดไฟล์ให้ครบทุกข้อ (1-3)")
+    if (up_express_asia is None and up_express_green is None) or up_catalog is None or up_vendorinfo is None:
+        st.error("กรุณาอัปโหลด Express อย่างน้อย 1 ไฟล์ (ASIA หรือ GREEN) และไฟล์ข้อ 2-3 ให้ครบ")
         st.stop()
 
     if max_factor < min_factor:
@@ -56,6 +64,13 @@ if btn:
 
         p_asia = td / "Express_A.xlsx"
         p_green = td / "Express_G.xlsx"
+
+        if up_express_asia is not None:
+            p_asia.write_bytes(up_express_asia.getvalue())
+
+        if up_express_green is not None:
+            p_green.write_bytes(up_express_green.getvalue())
+
         p_catalog = td / "catalog.xlsx"
         p_vendorinfo = td / "vendorinfo.xlsx"
         p_template = td / "template.xlsx"
