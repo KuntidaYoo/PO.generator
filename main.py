@@ -320,6 +320,28 @@ def extract_money_2dp_numbers_from_row(row: pd.Series, scan_cols: int = 25) -> L
         out.extend(_money_tokens_2dp_in_text(s))
     return out
 
+def extract_5_6_block_from_money_cell(row: pd.Series) -> Optional[List[float]]:
+    """
+    Extract the 5/6-number block ONLY from the same 'money-block cell'
+    (the cell that contains many 2dp numbers).
+    This prevents extra numbers elsewhere in the row from shifting nums[-6:].
+    """
+    money_idx = find_money_block_cell(row, min_tokens=3)
+    if money_idx < 0:
+        return None
+
+    s = str(row.iloc[money_idx]).replace("\xa0", " ").strip()
+    if not s:
+        return None
+
+    nums = _money_tokens_2dp_in_text(s)
+
+    if len(nums) >= 6:
+        return nums[-6:]
+    if len(nums) >= 5:
+        return nums[-5:]
+    return None
+
 
 def find_money_block_cell(row: pd.Series, min_tokens: int = 3) -> int:
     """
@@ -429,11 +451,14 @@ def parse_line_to_fields(row: pd.Series, merged_line: str) -> Optional[Dict[str,
     if not product_str:
         return None
 
-    nums = extract_money_2dp_numbers_from_row(row, scan_cols=25)
-    if len(nums) < 5:
-        return None
+    block = extract_5_6_block_from_money_cell(row)
 
-    block = nums[-6:] if len(nums) >= 6 else nums[-5:]
+    # fallback (if no dense money cell found)
+    if not block:
+        nums = extract_money_2dp_numbers_from_row(row, scan_cols=25)
+        if len(nums) < 5:
+            return None
+        block = nums[-6:] if len(nums) >= 6 else nums[-5:]
 
     # your old mapping:
     # if 6 numbers: sale=block[2], stock=block[3], on_order=block[5]
@@ -1137,8 +1162,16 @@ def generate_po_streamlit(
     """
     vendor_code = str(vendor_code).strip().upper()
 
-    df_asia, info_asia = parse_express_file(express_asia_path, "ASIA")
-    df_green, info_green = parse_express_file(express_green_path, "GREEN")
+    # allow missing express files
+    if express_asia_path and os.path.exists(express_asia_path):
+        df_asia, info_asia = parse_express_file(express_asia_path, "ASIA")
+    else:
+        df_asia, info_asia = pd.DataFrame(), {"months": 1}
+
+    if express_green_path and os.path.exists(express_green_path):
+        df_green, info_green = parse_express_file(express_green_path, "GREEN")
+    else:
+        df_green, info_green = pd.DataFrame(), {"months": 1}
 
     months = 1
     if info_asia and info_asia.get("months", 0) > 0:
