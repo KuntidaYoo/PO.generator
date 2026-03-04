@@ -752,6 +752,44 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
 # =========================
 # EXCEL IMAGE + STYLE HELPERS
 # =========================
+def _add_png(ws, png_path: str, anchor_cell: str, width_px: Optional[int] = None):
+    """Add a PNG (from file path) into a sheet at anchor_cell, optionally resizing by width."""
+    if not png_path or not os.path.exists(png_path):
+        return
+
+    img = XLImage(png_path)
+
+    # Resize by width, keep aspect ratio
+    if width_px is not None:
+        try:
+            w0, h0 = img.width, img.height
+            if w0 and h0 and w0 > 0:
+                scale = float(width_px) / float(w0)
+                img.width = int(w0 * scale)
+                img.height = int(h0 * scale)
+        except Exception:
+            pass
+
+    img.anchor = anchor_cell
+    ws.add_image(img)
+
+
+def add_logo_and_footer(ws, base_dir: str, footer_row: int,
+                        logo_cell: str = "A1",
+                        logo_width_px: int = 260,
+                        footer_width_px: int = 650):
+    """
+    Add logo at fixed top location + footer below totals.
+    Expects:
+      base_dir/logo.png
+      base_dir/footer_signatures.png
+    """
+    logo_path = os.path.join(base_dir, "logo.png")
+    footer_path = os.path.join(base_dir, "footer_signatures.png")
+
+    _add_png(ws, logo_path, anchor_cell=logo_cell, width_px=logo_width_px)
+    _add_png(ws, footer_path, anchor_cell=f"A{int(footer_row)}", width_px=footer_width_px)
+
 def _excel_colwidth_to_pixels(width):
     """Convert Excel col width to pixels."""
     if width is None:
@@ -999,6 +1037,9 @@ def generate_po_from_combined(
     ws = wb.copy_worksheet(template_ws)
     ws.title = "PO"
 
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _add_png(ws, os.path.join(BASE_DIR, "logo.png"), anchor_cell="A1", width_px=260)
+
     copy_column_widths(template_ws, ws)
 
     po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
@@ -1140,6 +1181,10 @@ def generate_po_from_combined(
             col_amt=col_amt,
             rate_thb_per_cny=float(rate_thb_per_cny),
         )
+        # footer must be lower than total amount THB line
+        footer_row = total_block_start + 3  # adjust if your footer should be a bit lower
+        _add_png(ws, os.path.join(BASE_DIR, "footer_signatures.png"),
+                 anchor_cell=f"A{footer_row}", width_px=1200)
 
     wb.remove(template_ws)
     wb.save(output_path)
