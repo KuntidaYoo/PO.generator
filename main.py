@@ -195,6 +195,42 @@ def is_header_or_separator(line: str) -> bool:
         return True
     return False
 
+def build_dense_chunks_no_space(row: pd.Series, max_scan_cols: int = 60) -> List[Tuple[int, int, str]]:
+    """
+    Returns list of (start_idx, end_idx, chunk_text)
+    chunk_text is concatenation of adjacent non-empty cells WITHOUT spaces.
+    A chunk ends when we hit an empty cell.
+    """
+    chunks = []
+    cur = []
+    start = None
+
+    def is_empty(v) -> bool:
+        if v is None:
+            return True
+        s = str(v).replace("\xa0", " ").strip()
+        return s == "" or s.lower() == "nan"
+
+    n = min(len(row), max_scan_cols)
+
+    for i in range(n):
+        v = row.iloc[i]
+        if is_empty(v):
+            if cur:
+                chunks.append((start, i - 1, "".join(cur)))
+                cur = []
+                start = None
+            continue
+
+        s = str(v).replace("\xa0", " ").strip()
+        if start is None:
+            start = i
+        cur.append(s)
+
+    if cur:
+        chunks.append((start, n - 1, "".join(cur)))
+
+    return chunks
 
 # =========================
 # PRODUCT SPLIT
@@ -320,21 +356,16 @@ def extract_money_2dp_numbers_from_row(row: pd.Series, scan_cols: int = 25) -> L
         out.extend(_money_tokens_2dp_in_text(s))
     return out
 
-def extract_5_6_block_from_money_cell(row: pd.Series) -> Optional[List[float]]:
+def extract_5_6_block_from_money_chunk(row: pd.Series) -> Optional[List[float]]:
     """
-    Extract the 5/6-number block ONLY from the same 'money-block cell'
-    (the cell that contains many 2dp numbers).
-    This prevents extra numbers elsewhere in the row from shifting nums[-6:].
+    Extract 5/6 numbers from the detected dense chunk (not from whole row).
     """
-    money_idx = find_money_block_cell(row, min_tokens=3)
-    if money_idx < 0:
+    found = find_money_block_chunk(row, min_tokens=3, max_scan_cols=60)
+    if not found:
         return None
 
-    s = str(row.iloc[money_idx]).replace("\xa0", " ").strip()
-    if not s:
-        return None
-
-    nums = _money_tokens_2dp_in_text(s)
+    _, _, txt = found
+    nums = _money_tokens_2dp_in_text(txt)
 
     if len(nums) >= 6:
         return nums[-6:]
@@ -343,21 +374,21 @@ def extract_5_6_block_from_money_cell(row: pd.Series) -> Optional[List[float]]:
     return None
 
 
-def find_money_block_cell(row: pd.Series, min_tokens: int = 3) -> int:
+def find_money_block_chunk(row: pd.Series, min_tokens: int = 3, max_scan_cols: int = 60):
     """
-    Return money_block_cell_index (0-based) where a single cell contains >= min_tokens money 2dp tokens.
-    If none found, return -1.
+    Find the chunk that contains >= min_tokens money 2dp tokens.
+    Returns (start_idx, end_idx, chunk_text) or None.
     """
-    for i in range(len(row)):
-        v = row.iloc[i]
-        if v is None:
-            continue
-        s = str(v).replace("\xa0", " ").strip()
-        if not s:
-            continue
-        if len(_MONEY_2DP_RE.findall(s)) >= min_tokens:
-            return i
-    return -1
+    chunks = build_dense_chunks_no_space(row, max_scan_cols=max_scan_cols)
+    best = None
+
+    for (s, e, txt) in chunks:
+        cnt = len(_MONEY_2DP_RE.findall(txt))
+        if cnt >= min_tokens:
+            # pick the first matching chunk (or you can pick the one with most tokens)
+            return (s, e, txt)
+
+    return None
 
 
 def parse_yuan_value(v) -> Optional[float]:
@@ -392,18 +423,15 @@ def parse_yuan_value(v) -> Optional[float]:
 
 def extract_yuan_after_money_block(row: pd.Series, lookahead_cells: int = 20) -> Optional[float]:
     """
-    FINAL RULE YOU CONFIRMED:
-      - locate money-block cell (contains many 2dp numbers)
-      - scan next 15-20 cells to the right
-      - the first valid numeric cell there is yuan
-      - if none -> None
+    Same logic: find money area, then scan next 15-20 cells for yuan.
     """
-    money_idx = find_money_block_cell(row, min_tokens=3)
-    if money_idx < 0:
+    found = find_money_block_chunk(row, min_tokens=3, max_scan_cols=60)
+    if not found:
         return None
 
-    start = money_idx + 1
-    end = min(len(row), money_idx + 1 + int(lookahead_cells))
+    _, end_idx, _ = found  # <-- anchor to the END of the dense chunk
+    start = end_idx + 1
+    end = min(len(row), start + int(lookahead_cells))
 
     for j in range(start, end):
         v = row.iloc[j]
@@ -415,6 +443,34 @@ def extract_yuan_after_money_block(row: pd.Series, lookahead_cells: int = 20) ->
         y = parse_yuan_value(s)
         if y is not None:
             return y
+
+    return None
+    """
+    FINAL RULE YOU CONFIRMED:
+      - locate money-block cell (contains many 2dp numbers)
+      - scan next 15-20 cells to the right
+      - the first valid numeric cell there is yuan
+      - if none -> None
+    """
+    found = find_money_block_chunk(row, min_tokens=3, max_scan_cols=60)
+    if not found:
+        return None
+
+    _, end_idx, _ = found  # <-- anchor to the END of the dense chunk
+    start = end_idx + 1
+    end = min(len(row), start + int(lookahead_cells))
+
+    for j in range(start, end):
+        v = row.iloc[j]
+        if v is None:
+            continue
+        s = str(v).replace("\xa0", " ").strip()
+        if not s:
+            continue
+        y = parse_yuan_value(s)
+        if y is not None:
+            return y
+
     return None
 
 
@@ -451,7 +507,7 @@ def parse_line_to_fields(row: pd.Series, merged_line: str) -> Optional[Dict[str,
     if not product_str:
         return None
 
-    block = extract_5_6_block_from_money_cell(row)
+    block = extract_5_6_block_from_money_chunk(row)
 
     # fallback (if no dense money cell found)
     if not block:
