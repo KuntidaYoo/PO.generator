@@ -753,21 +753,28 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
 # EXCEL IMAGE + STYLE HELPERS
 # =========================
 def _add_png(ws, png_path: str, anchor_cell: str, width_px: Optional[int] = None):
-    """Add a PNG (from file path) into a sheet at anchor_cell, optionally resizing by width."""
-    if not png_path or not os.path.exists(png_path):
+    """
+    Add an image (png/jpg) into a sheet at anchor_cell, optionally resizing by width.
+    Keeps aspect ratio. Safe: no undefined variables, no special buffering needed for file-path images.
+    """
+    if not png_path:
+        return
+    if not os.path.exists(png_path):
         return
 
     img = XLImage(png_path)
 
-    # Resize by width, keep aspect ratio
+    # Resize by width (keep aspect ratio)
     if width_px is not None:
         try:
-            w0, h0 = img.width, img.height
-            if w0 and h0 and w0 > 0:
-                scale = float(width_px) / float(w0)
-                img.width = int(w0 * scale)
-                img.height = int(h0 * scale)
+            w0 = float(img.width or 0)
+            h0 = float(img.height or 0)
+            if w0 > 0 and h0 > 0:
+                scale = float(width_px) / w0
+                img.width = int(round(w0 * scale))
+                img.height = int(round(h0 * scale))
         except Exception:
+            # If anything weird happens, just keep original size
             pass
 
     img.anchor = anchor_cell
@@ -1014,13 +1021,12 @@ def generate_po_from_combined(
     min_factor: int,
     max_factor: int,
 ) -> str:
-    """
-    Generate PO file from filtered combined_df (below MIN only).
-    """
+
     if po_date is None:
         po_date = datetime.date.today()
 
     os.makedirs(PO_OUTPUT_FOLDER, exist_ok=True)
+
     vendor_key = str(vendor_code).strip().upper()
     output_path = os.path.join(PO_OUTPUT_FOLDER, f"PO_{vendor_key}_BELOW_MIN.xlsx")
 
@@ -1037,7 +1043,16 @@ def generate_po_from_combined(
     ws = wb.copy_worksheet(template_ws)
     ws.title = "PO"
 
+    # locate total block
+    pos_total = find_label_cell(ws, "TOTAL AMOUNT CNY", max_row=200, max_col=60)
+    if not pos_total:
+        raise RuntimeError("Cannot find TOTAL AMOUNT CNY in template.")
+
+    BASE_TOTAL_ROW = pos_total[0]
+
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    # add logo
     _add_png(ws, os.path.join(BASE_DIR, "logo.png"), anchor_cell="A1", width_px=260)
 
     copy_column_widths(template_ws, ws)
@@ -1052,6 +1067,7 @@ def generate_po_from_combined(
 
     min_key_old = find_one(["MIN*4", "MIN * 4", "MIN×4", "MIN x4", "MINX4"])
     max_key_old = find_one(["MAX*7", "MAX * 7", "MAX×7", "MAX x7", "MAXX7"])
+
     if not min_key_old or not max_key_old:
         raise RuntimeError("Cannot find MIN/MAX header in template.")
 
@@ -1071,6 +1087,7 @@ def generate_po_from_combined(
     col_amt = get_column_letter(po_cols["AMOUNT (CNY)"])
     col_thb = get_column_letter(po_cols["THB"])
 
+    # Header fields
     ws["H6"] = vendor_key
     ws["H6"].font = Font(color="FF0000", bold=True, size=18)
 
@@ -1089,11 +1106,25 @@ def generate_po_from_combined(
         r, c = pos
         ws.cell(r, c + 1).value = supplier_addr
 
-    combined_df = combined_df.sort_values(by=["รหัสสินค้า", "รายละเอียดสินค้า"], ascending=[True, True]).reset_index(drop=True)
+    combined_df = combined_df.sort_values(
+        by=["รหัสสินค้า", "รายละเอียดสินค้า"],
+        ascending=[True, True]
+    ).reset_index(drop=True)
+
+    # ensure totals section is not overwritten
+    needed_item_rows = len(combined_df)
+    available_item_rows = BASE_TOTAL_ROW - ITEM_START_ROW
+
+    extra = max(0, needed_item_rows - available_item_rows)
+
+    if extra > 0:
+        ws.insert_rows(BASE_TOTAL_ROW, amount=extra)
+        BASE_TOTAL_ROW += extra
 
     current_row = ITEM_START_ROW
 
     for _, row in combined_df.iterrows():
+
         line = current_row
         current_row += 1
 
@@ -1112,21 +1143,23 @@ def generate_po_from_combined(
         use_month = int(row["USE_MONTH"]) if not pd.isna(row["USE_MONTH"]) else 0
 
         yuan = row["หยวน"] if not pd.isna(row["หยวน"]) else None
-        try:
-            yuan_num = float(yuan) if yuan is not None else None
-        except Exception:
-            yuan_num = None
+        yuan_num = float(yuan) if yuan is not None else None
 
         ws.cell(line, po_cols["BUYER ITEM NO."]).value = buyer_item
 
         if cat.get("img_bytes"):
             add_image_to_cell(ws, f"B{line}", cat["img_bytes"])
 
-        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = cat.get("goods_desc", row.get("รายละเอียดสินค้า", ""))
+        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = cat.get(
+            "goods_desc", row.get("รายละเอียดสินค้า", "")
+        )
         ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
         ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
         ws.cell(line, po_cols["Weight"]).value = cat.get("weight", "")
-        ws.cell(line, po_cols["QTY PER CARTON"]).value = qty_per_carton_num if qty_per_carton_num > 0 else None
+
+        ws.cell(line, po_cols["QTY PER CARTON"]).value = (
+            qty_per_carton_num if qty_per_carton_num > 0 else None
+        )
 
         ws.cell(line, po_cols["STOCK GREEN"]).value = float(row["STOCK_GREEN"])
         ws.cell(line, po_cols["STOCK ASIA"]).value = float(row["STOCK_ASIA"])
@@ -1167,29 +1200,31 @@ def generate_po_from_combined(
         ws[f"{col_amt}{line}"] = f"={col_fob}{line}*{col_tot_order}{line}"
 
     if len(combined_df) > 0:
+
         last_item_row = ITEM_START_ROW + len(combined_df) - 1
         force_bottom_border(ws, last_item_row, 1, PO_LAST_COL)
 
-        total_block_start = last_item_row + 1
-        paste_total_block_and_fix(
-            ws=ws,
-            template_ws=template_ws,
-            total_block_start=total_block_start,
-            po_last_col=PO_LAST_COL,
-            item_start_row=ITEM_START_ROW,
-            last_item_row=last_item_row,
-            col_amt=col_amt,
-            rate_thb_per_cny=float(rate_thb_per_cny),
+        pos_thb = find_label_cell(ws, "TOTAL AMOUNT THB", max_row=400, max_col=60)
+        if not pos_thb:
+            raise RuntimeError("Cannot find TOTAL AMOUNT THB in sheet.")
+
+        thb_row = pos_thb[0]
+        exc_row = thb_row - 1
+        ws.row_dimensions[exc_row].height = 40
+
+        footer_row = thb_row + 2
+
+        _add_png(
+            ws,
+            os.path.join(BASE_DIR, "footer_signatures.png"),
+            anchor_cell=f"A{footer_row}",
+            width_px=1200,
         )
-        # footer must be lower than total amount THB line
-        footer_row = total_block_start + 3  # adjust if your footer should be a bit lower
-        _add_png(ws, os.path.join(BASE_DIR, "footer_signatures.png"),
-                 anchor_cell=f"A{footer_row}", width_px=1200)
 
     wb.remove(template_ws)
     wb.save(output_path)
-    return output_path
 
+    return output_path
 
 def export_vendor_all_items_excel(vendor_rows_all: pd.DataFrame, vendor_code: str, out_folder: str = PO_OUTPUT_FOLDER) -> str:
     """
