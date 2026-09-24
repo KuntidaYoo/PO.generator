@@ -633,7 +633,9 @@ def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: in
     key_cols = ["buyer", "รหัสสินค้า", "barcode", "รายละเอียดสินค้า", "หยวน"]
     combined = pd.merge(g_asia, g_green, on=key_cols, how="outer", sort=False)
 
-    # The PO barcode must come from GREEN, even when an ASIA-only row has one.
+    # Keep the source barcode for catalog lookup. The printed PO barcode still
+    # comes only from GREEN, as requested for column X.
+    combined["catalog_match_barcode"] = combined["barcode"]
     combined["barcode"] = combined["barcode"].where(
         combined["present_GREEN"].eq(True), ""
     )
@@ -692,11 +694,29 @@ def load_vendor_map(path: str) -> dict:
 # =========================
 # CATALOG (multi-sheet per vendor)
 # =========================
+def normalize_barcode(value, number_format: str = "") -> str:
+    """Read an identifier as text, including simple Excel zero-padded cells."""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return ""
+        barcode = str(int(value)) if float(value).is_integer() else str(value)
+    else:
+        barcode = str(value)
+    barcode = re.sub(r"\s+", "", barcode)
+    fmt = str(number_format or "").strip()
+    if barcode.isdigit() and re.fullmatch(r"0+", fmt):
+        barcode = barcode.zfill(len(fmt))
+    return barcode
+
+
 def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
     """
     Read catalog workbook where each vendor has its own sheet.
     Column mapping by Excel position:
-      A=item no, B=picture, C=desc, D=brand, E=material, F=weight, G=qty/carton
+      A=item no, B=picture, C=desc, D=brand, E=material, F=weight,
+      G=qty/carton, H=unit price (unused), I=barcode
     """
     wb = openpyxl.load_workbook(catalog_path)
     want = str(vendor_code).strip().upper()
@@ -720,6 +740,7 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
     COL_MAT = 5
     COL_WEIGHT = 6
     COL_QTYCT = 7
+    COL_BARCODE = 9
     HEADER_ROW_LOCAL = 1
 
     img_at = {}
@@ -743,6 +764,10 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
             "material": ws.cell(r, COL_MAT).value,
             "weight": ws.cell(r, COL_WEIGHT).value,
             "qty_per_carton": ws.cell(r, COL_QTYCT).value,
+            "barcode": normalize_barcode(
+                ws.cell(r, COL_BARCODE).value,
+                ws.cell(r, COL_BARCODE).number_format,
+            ),
             "img_bytes": img_at.get((r, COL_PIC)),
         })
     return catalog
@@ -754,19 +779,65 @@ def resolve_catalog_variant(
     description: str,
     variant_count: int,
     description_variant_count: int = 1,
+    barcode: str = "",
+    barcode_description_count: int = 1,
 ) -> dict:
-    """Use catalog details that identify this variant or agree across candidates."""
+    """Match a catalog row by code and barcode, then use safe legacy fallbacks."""
     entries = catalog_map.get(item_code, [])
     if not entries:
         return {}
 
+    source_barcode = normalize_barcode(barcode)
     normalized_desc = re.sub(r"\s+", " ", str(description or "")).strip().casefold()
-    exact = [
-        entry for entry in entries
-        if normalized_desc and
-        re.sub(r"\s+", " ", str(entry.get("goods_desc") or "")).strip().casefold() == normalized_desc
-    ]
-    candidates = exact if exact else entries
+
+    def same_description(entry):
+        return (
+            bool(normalized_desc)
+            and re.sub(r"\s+", " ", str(entry.get("goods_desc") or "")).strip().casefold()
+            == normalized_desc
+        )
+
+    selected = None
+    candidates = entries
+    if source_barcode:
+        barcode_matches = [
+            entry for entry in entries
+            if normalize_barcode(entry.get("barcode")) == source_barcode
+        ]
+        if barcode_matches:
+            candidates = barcode_matches
+            exact = [entry for entry in barcode_matches if same_description(entry)]
+            if len(exact) == 1:
+                selected = exact[0]
+            elif len(barcode_matches) == 1 and barcode_description_count == 1:
+                selected = barcode_matches[0]
+        elif not any(entry.get("barcode") for entry in entries):
+            # Older catalogs do not have barcodes; keep the description lookup.
+            exact = [entry for entry in entries if same_description(entry)]
+            candidates = exact if exact else entries
+            if len(exact) == 1 and description_variant_count == 1:
+                selected = exact[0]
+            elif not exact and len(entries) == 1 and variant_count == 1:
+                selected = entries[0].copy()
+                selected["goods_desc"] = None
+        elif len(entries) == 1:
+            raise ValueError(
+                f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
+                "QTY PER CARTON cannot be verified from another variant. "
+                "Add this barcode in catalog column I."
+            )
+        # A barcode absent from a populated catalog must not select a wrong color.
+    else:
+        exact = [entry for entry in entries if same_description(entry)]
+        candidates = exact if exact else entries
+        if len(exact) == 1 and description_variant_count == 1:
+            selected = exact[0]
+        elif not exact and len(entries) == 1 and variant_count == 1:
+            selected = entries[0].copy()
+            selected["goods_desc"] = None
+
+    if selected is not None:
+        return selected.copy()
 
     resolved = {}
     for field in ("brand", "material", "weight", "qty_per_carton"):
@@ -785,21 +856,15 @@ def resolve_catalog_variant(
         if len(set(normalized_values)) == 1:
             resolved[field] = "" if normalized_values[0][0] == "blank" else values[0]
         elif field == "qty_per_carton":
+            detail = f", barcode {source_barcode}" if source_barcode else ""
             raise ValueError(
-                f"Ambiguous QTY PER CARTON for item {item_code} ({description}). "
-                "Use a catalog row with the matching variant description."
+                f"Ambiguous QTY PER CARTON for item {item_code}{detail} ({description}). "
+                "Add a unique BARCODE in catalog column I or correct the carton quantities."
             )
         else:
             resolved[field] = ""
 
-    # Catalogs have no barcode column. A description shared by several source
-    # barcodes cannot identify which picture belongs to an individual row.
-    if len(exact) == 1 and description_variant_count == 1:
-        resolved["img_bytes"] = exact[0].get("img_bytes")
-    elif not exact and len(entries) == 1 and variant_count == 1:
-        resolved["img_bytes"] = entries[0].get("img_bytes")
-    else:
-        resolved["img_bytes"] = None
+    resolved["img_bytes"] = None
     return resolved
 
 
@@ -1076,6 +1141,7 @@ def generate_po_from_combined(
     max_factor: int,
     variant_counts_by_code: Optional[Dict[str, int]] = None,
     variant_counts_by_code_description: Optional[Dict[Tuple[str, str], int]] = None,
+    barcode_description_counts: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> str:
 
     if po_date is None:
@@ -1174,6 +1240,14 @@ def generate_po_from_combined(
         variant_counts_by_code_description = combined_df.groupby(
             ["รหัสสินค้า", "รายละเอียดสินค้า"]
         ).size().to_dict()
+    match_barcode_col = (
+        "catalog_match_barcode"
+        if "catalog_match_barcode" in combined_df.columns else "barcode"
+    )
+    if barcode_description_counts is None:
+        barcode_description_counts = combined_df.groupby(
+            ["รหัสสินค้า", match_barcode_col]
+        )["รายละเอียดสินค้า"].nunique().to_dict()
 
     combined_df = combined_df.sort_values(
         by=["รหัสสินค้า", "รายละเอียดสินค้า", "barcode"],
@@ -1202,12 +1276,18 @@ def generate_po_from_combined(
 
         buyer_item = str(row["รหัสสินค้า"]).strip()
         source_desc = str(row.get("รายละเอียดสินค้า") or "").strip()
+        po_barcode = normalize_barcode(row.get("barcode", ""))
+        source_barcode = normalize_barcode(row.get(match_barcode_col, ""))
         cat = resolve_catalog_variant(
             catalog_map,
             buyer_item,
             source_desc,
             variant_counts_by_code.get(buyer_item, 1),
             variant_counts_by_code_description.get((buyer_item, source_desc), 1),
+            barcode=source_barcode,
+            barcode_description_count=barcode_description_counts.get(
+                (buyer_item, source_barcode), 1
+            ),
         )
 
         qty_per_carton = cat.get("qty_per_carton", "")
@@ -1226,10 +1306,11 @@ def generate_po_from_combined(
         if cat.get("img_bytes"):
             add_image_to_cell(ws, f"B{line}", cat["img_bytes"])
 
-        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = source_desc
-        barcode = row.get("barcode", "")
+        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = (
+            cat.get("goods_desc") or source_desc
+        )
         barcode_cell = ws.cell(line, po_cols["BARCODE"])
-        barcode_cell.value = "" if pd.isna(barcode) else str(barcode)
+        barcode_cell.value = po_barcode
         barcode_cell.number_format = "@"
         ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
         ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
@@ -1433,6 +1514,9 @@ def generate_po_streamlit(
             variant_counts_by_code_description=vendor_rows_all.groupby(
                 ["รหัสสินค้า", "รายละเอียดสินค้า"]
             ).size().to_dict(),
+            barcode_description_counts=vendor_rows_all.groupby(
+                ["รหัสสินค้า", "catalog_match_barcode"]
+            )["รายละเอียดสินค้า"].nunique().to_dict(),
         )
 
     return {

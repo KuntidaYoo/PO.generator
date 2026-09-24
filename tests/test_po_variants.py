@@ -90,6 +90,40 @@ def make_catalog(
     wb.save(path)
 
 
+def make_barcode_catalog(path: Path, entries: list[dict]) -> None:
+    """Create a catalog using the new I/BARCODE column and optional pictures."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "A0029"
+    ws.append([
+        "BUYER ITEM NO.", "GOODS PICTURE", "GOODS DESCRIPTION", "BRAND",
+        "MATERIAL", "Weight", "QTY PER CARTON", "UNIT PRICE (FOB)", "BARCODE",
+    ])
+    for row_number, entry in enumerate(entries, start=2):
+        ws.append([
+            "MC-510", None, entry["description"], entry.get("brand", "Brand"),
+            entry.get("material", "Steel"), entry.get("weight", 1),
+            entry.get("carton", 10), None, entry.get("barcode", ""),
+        ])
+        ws.cell(row_number, 9).number_format = "@"
+        color = entry.get("picture_color")
+        if color:
+            png = path.parent / f"catalog_barcode_{row_number}.png"
+            PILImage.new("RGB", (12, 12), color).save(png)
+            ws.add_image(XLImage(str(png)), f"B{row_number}")
+    wb.save(path)
+
+
+def item_picture_colors(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict[int, tuple[int, int, int]]:
+    return {
+        image.anchor._from.row + 1: PILImage.open(BytesIO(image._data())).convert("RGB").getpixel((0, 0))
+        for image in ws._images
+        if getattr(getattr(image.anchor, "_from", None), "col", None) == 1
+        and getattr(getattr(image.anchor, "_from", None), "row", None) is not None
+        and image.anchor._from.row >= 8
+    }
+
+
 class POVariantTests(unittest.TestCase):
     def test_mc510_sample_colors_keep_three_rows(self) -> None:
         # These values are the three A0029 / MC-510 entries in the PO-G sample.
@@ -390,6 +424,222 @@ class POVariantTests(unittest.TestCase):
                             7,
                             variant_counts_by_code={"MC-510": 2},
                         )
+
+    def test_catalog_barcode_selects_color_pictures_descriptions_and_metadata(self) -> None:
+        # Both Express rows have the same wording; only their GREEN barcodes
+        # identify the different catalog colors and their different carton sizes.
+        rows = combine(
+            [],
+            [
+                source_row("MC-510 fancy faucet", barcode="000123", sales=6),
+                source_row("MC-510 fancy faucet", barcode="000456", sales=9),
+            ],
+        )
+        self.assertEqual(len(rows), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {
+                    "barcode": "000123", "description": "MC-510 ก๊อกแฟนซีสี-แดง(R)",
+                    "brand": "Red brand", "material": "Red metal", "weight": 1.25,
+                    "carton": 12, "picture_color": "red",
+                },
+                {
+                    "barcode": "000456", "description": "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)",
+                    "brand": "Blue brand", "material": "Blue metal", "weight": 2.5,
+                    "carton": 24, "picture_color": "blue",
+                },
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            by_barcode = {po[f"X{row}"].value: row for row in (9, 10)}
+            self.assertEqual(set(by_barcode), {"000123", "000456"})
+            self.assertTrue(all(po[f"X{row}"].data_type == "s" for row in by_barcode.values()))
+            expected = {
+                "000123": ("MC-510 ก๊อกแฟนซีสี-แดง(R)", "Red brand", "Red metal", 1.25, 12, (255, 0, 0)),
+                "000456": ("MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)", "Blue brand", "Blue metal", 2.5, 24, (0, 0, 255)),
+            }
+            pictures = item_picture_colors(po)
+            for barcode, (description, brand, material, weight, carton, color) in expected.items():
+                row = by_barcode[barcode]
+                self.assertEqual(po[f"C{row}"].value, description)
+                self.assertEqual(po[f"D{row}"].value, brand)
+                self.assertEqual(po[f"E{row}"].value, material)
+                self.assertEqual(po[f"F{row}"].value, weight)
+                self.assertEqual(po[f"G{row}"].value, carton)
+                self.assertEqual(pictures[row], color)
+
+    def test_unmatched_catalog_barcode_does_not_copy_wrong_picture_or_description(self) -> None:
+        rows = combine([], [source_row("MC-510 ก๊อกแฟนซีสี-แดง(R)", barcode="000999", sales=3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {
+                    "barcode": "000123", "description": "MC-510 ก๊อกแฟนซีสี-แดง(R)",
+                    "carton": 10, "picture_color": "red",
+                },
+                {
+                    "barcode": "000456", "description": "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)",
+                    "carton": 10, "picture_color": "blue",
+                },
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertEqual(po["C9"].value, "MC-510 ก๊อกแฟนซีสี-แดง(R)")
+            self.assertEqual(po["G9"].value, 10)  # shared by all catalog candidates
+            self.assertEqual(item_picture_colors(po), {})
+
+    def test_unmatched_barcode_cannot_use_single_other_variants_carton_size(self) -> None:
+        rows = combine([], [source_row("MC-510 unknown color", barcode="000999", sales=3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "single_other_variant.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {
+                    "barcode": "000123", "description": "MC-510 ก๊อกแฟนซีสี-แดง(R)",
+                    "carton": 24, "picture_color": "red",
+                },
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                with self.assertRaisesRegex(
+                    ValueError, r"(?is)(?=.*BARCODE)(?=.*QTY PER CARTON)"
+                ):
+                    main.generate_po_from_combined(
+                        rows, "A0029", datetime.date(2026, 9, 24), 6,
+                        str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                        4, 7,
+                    )
+
+    def test_blank_catalog_barcodes_still_match_legacy_description(self) -> None:
+        red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
+        rows = combine([], [source_row(red, barcode="000123", sales=3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_blank_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "", "description": red, "picture_color": "red"},
+                {"barcode": "", "description": "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)", "picture_color": "blue"},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertEqual(po["C9"].value, red)
+            self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
+
+    def test_missing_source_barcode_can_match_unique_catalog_description(self) -> None:
+        red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
+        rows = combine([], [source_row(red, barcode="", sales=3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "000123", "description": red, "picture_color": "red"},
+                {"barcode": "000456", "description": "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)", "picture_color": "blue"},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertIsNone(po["X9"].value)
+            self.assertEqual(po["C9"].value, red)
+            self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
+
+    def test_asia_only_barcode_matches_catalog_but_po_barcode_stays_blank(self) -> None:
+        rough_description = "MC-510 fancy faucet"
+        catalog_description = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
+        rows = combine(
+            [source_row(rough_description, barcode="000123", sales=3)], []
+        )
+        self.assertEqual(rows.iloc[0]["barcode"], "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {
+                    "barcode": "000123", "description": catalog_description,
+                    "carton": 12, "picture_color": "red",
+                },
+                {
+                    "barcode": "000456", "description": "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)",
+                    "carton": 24, "picture_color": "blue",
+                },
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertIsNone(po["X9"].value)
+            self.assertEqual(po["C9"].value, catalog_description)
+            self.assertEqual(po["G9"].value, 12)
+            self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
+
+    def test_shared_source_barcode_does_not_assign_one_picture_to_two_descriptions(self) -> None:
+        red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
+        blue = "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)"
+        rows = combine([], [
+            source_row(red, barcode="000123", sales=3),
+            source_row(blue, barcode="000123", sales=3),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog_with_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "000123", "description": red, "picture_color": "red"},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 24), 6,
+                    str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                    4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            descriptions = {po[f"C{row}"].value: row for row in (9, 10)}
+            self.assertEqual(set(descriptions), {red, blue})
+            self.assertEqual(po[f"X{descriptions[red]}"].value, "000123")
+            self.assertEqual(po[f"X{descriptions[blue]}"].value, "000123")
+            self.assertEqual(item_picture_colors(po), {descriptions[red]: (255, 0, 0)})
+
+    def test_duplicate_catalog_barcode_requires_unique_description_or_shared_carton(self) -> None:
+        red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
+        blue = "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "duplicate_barcodes.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "000123", "description": red, "carton": 10, "picture_color": "red"},
+                {"barcode": "000123", "description": blue, "carton": 20, "picture_color": "blue"},
+            ])
+            catalog_map = main.build_catalog_map(str(catalog_path), "A0029")
+            with self.assertRaisesRegex((ValueError, RuntimeError), r"(?i)carton"):
+                main.resolve_catalog_variant(catalog_map, "MC-510", "unknown color", 1, barcode="000123")
+
+            selected = main.resolve_catalog_variant(catalog_map, "MC-510", red, 1, barcode="000123")
+            self.assertEqual(selected["qty_per_carton"], 10)
+            self.assertIsNotNone(selected["img_bytes"])
 
 
 if __name__ == "__main__":
