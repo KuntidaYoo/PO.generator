@@ -740,6 +740,14 @@ def normalize_barcode(value, number_format: str = "") -> str:
     return barcode
 
 
+class CatalogMap(dict):
+    """Catalog rows by item code, with a vendor-sheet-wide barcode index."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_barcode = {}
+
+
 def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
     """
     Read catalog workbook where each vendor has its own sheet.
@@ -781,24 +789,29 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
         except Exception:
             pass
 
-    catalog = {}
+    catalog = CatalogMap()
     for r in range(HEADER_ROW_LOCAL + 1, ws.max_row + 1):
         item_no = ws.cell(r, COL_ITEM_NO).value
-        if not item_no:
+        item_no = str(item_no).strip() if item_no is not None else ""
+        barcode = normalize_barcode(
+            ws.cell(r, COL_BARCODE).value,
+            ws.cell(r, COL_BARCODE).number_format,
+        )
+        if not item_no and not barcode:
             continue
-        item_no = str(item_no).strip()
-        catalog.setdefault(item_no, []).append({
+        entry = {
             "goods_desc": ws.cell(r, COL_DESC).value,
             "brand": ws.cell(r, COL_BRAND).value,
             "material": ws.cell(r, COL_MAT).value,
             "weight": ws.cell(r, COL_WEIGHT).value,
             "qty_per_carton": ws.cell(r, COL_QTYCT).value,
-            "barcode": normalize_barcode(
-                ws.cell(r, COL_BARCODE).value,
-                ws.cell(r, COL_BARCODE).number_format,
-            ),
+            "barcode": barcode,
             "img_bytes": img_at.get((r, COL_PIC)),
-        })
+        }
+        if item_no:
+            catalog.setdefault(item_no, []).append(entry)
+        if barcode:
+            catalog.by_barcode.setdefault(barcode, []).append(entry)
     return catalog
 
 
@@ -811,12 +824,33 @@ def resolve_catalog_variant(
     barcode: str = "",
     barcode_description_count: int = 1,
 ) -> dict:
-    """Match a catalog row by code and barcode, then use safe legacy fallbacks."""
+    """Match barcode across the vendor sheet, then use safe code fallbacks."""
     entries = catalog_map.get(item_code, [])
-    if not entries:
+    source_barcode = normalize_barcode(barcode)
+    if source_barcode:
+        barcode_index = getattr(catalog_map, "by_barcode", None)
+        barcode_matches = (
+            barcode_index.get(source_barcode, [])
+            if barcode_index is not None else [
+                entry for code_entries in catalog_map.values()
+                for entry in code_entries
+                if normalize_barcode(entry.get("barcode")) == source_barcode
+            ]
+        )
+        # A unique barcode identifies the catalog row even if column A has a typo.
+        if len(barcode_matches) == 1:
+            return barcode_matches[0].copy()
+    else:
+        barcode_matches = []
+    if not barcode_matches and not entries:
+        if source_barcode and (catalog_map or getattr(catalog_map, "by_barcode", None)):
+            raise ValueError(
+                f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
+                "QTY PER CARTON cannot be verified. "
+                "Add this barcode in catalog column I."
+            )
         return {}
 
-    source_barcode = normalize_barcode(barcode)
     normalized_desc = re.sub(r"\s+", " ", str(description or "")).strip().casefold()
 
     def same_description(entry):
@@ -829,17 +863,10 @@ def resolve_catalog_variant(
     selected = None
     candidates = entries
     if source_barcode:
-        barcode_matches = [
-            entry for entry in entries
-            if normalize_barcode(entry.get("barcode")) == source_barcode
-        ]
         if barcode_matches:
+            # Duplicate barcodes cannot identify a picture, even when one
+            # description looks closer. Keep only fields shared by every row.
             candidates = barcode_matches
-            exact = [entry for entry in barcode_matches if same_description(entry)]
-            if len(exact) == 1:
-                selected = exact[0]
-            elif len(barcode_matches) == 1 and barcode_description_count == 1:
-                selected = barcode_matches[0]
         elif not any(entry.get("barcode") for entry in entries):
             # Older catalogs do not have barcodes; keep the description lookup.
             exact = [entry for entry in entries if same_description(entry)]
@@ -849,13 +876,23 @@ def resolve_catalog_variant(
             elif not exact and len(entries) == 1 and variant_count == 1:
                 selected = entries[0].copy()
                 selected["goods_desc"] = None
-        elif len(entries) == 1:
-            raise ValueError(
-                f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
-                "QTY PER CARTON cannot be verified from another variant. "
-                "Add this barcode in catalog column I."
-            )
-        # A barcode absent from a populated catalog must not select a wrong color.
+        else:
+            # During a partial catalog update, a blank-barcode row can still
+            # match by its exact description. Never borrow a populated row
+            # whose barcode identifies a different variant.
+            blank_matches = [
+                entry for entry in entries
+                if not entry.get("barcode") and same_description(entry)
+            ]
+            if len(blank_matches) == 1 and description_variant_count == 1:
+                selected = blank_matches[0]
+            else:
+                raise ValueError(
+                    f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
+                    "QTY PER CARTON cannot be verified from another variant. "
+                    "Add this barcode in catalog column I or match one blank-barcode "
+                    "catalog description to the source description."
+                )
     else:
         exact = [entry for entry in entries if same_description(entry)]
         candidates = exact if exact else entries
