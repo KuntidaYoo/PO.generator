@@ -598,40 +598,79 @@ def parse_express_file(path: str, source_label: str) -> Tuple[pd.DataFrame, Dict
 # COMBINE + AGG
 # =========================
 def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Aggregate only rows that identify the same product variant and price."""
-    key_cols = ["buyer", "รหัสสินค้า", "barcode", "รายละเอียดสินค้า", "หยวน"]
+    """Sum each source by barcode; use description and price only without one."""
+    key_cols = [
+        "buyer", "รหัสสินค้า", "barcode", "_blank_barcode_desc", "_blank_barcode_price",
+    ]
     metric_cols = ["ยอดขาย", "สินค้าคงเหลือ", "ON_ORDER"]
     renamed = {
+        "รายละเอียดสินค้า": f"รายละเอียดสินค้า_{label}",
         "ยอดขาย": f"ยอดขาย_{label}",
         "สินค้าคงเหลือ": f"STOCK_{label}",
         "ON_ORDER": f"ON_ORDER_{label}",
+        "หยวน": f"หยวน_{label}",
     }
-    result_cols = key_cols + list(renamed.values()) + [f"หยวน_{label}", f"present_{label}"]
+    result_cols = key_cols + list(renamed.values()) + [f"present_{label}"]
     if df.empty:
         return pd.DataFrame(columns=result_cols)
 
     source = df.copy()
-    for col in ["buyer", "รหัสสินค้า", "barcode", "รายละเอียดสินค้า"]:
+    for col in ["buyer", "รหัสสินค้า", "รายละเอียดสินค้า"]:
         source[col] = source[col].fillna("").astype(str).str.strip()
+    source["barcode"] = source["barcode"].map(normalize_barcode)
     source["หยวน"] = pd.to_numeric(source["หยวน"], errors="coerce")
     for col in metric_cols:
         source[col] = pd.to_numeric(source[col], errors="coerce").fillna(0.0)
 
+    # One barcode must not silently choose between conflicting nonblank prices.
+    with_barcode = source[source["barcode"].ne("")]
+    for (buyer, item_code, barcode), prices in with_barcode.groupby(
+        ["buyer", "รหัสสินค้า", "barcode"], sort=False
+    )["หยวน"]:
+        if prices.nunique(dropna=True) > 1:
+            raise ValueError(
+                f"Conflicting {label} prices for supplier {buyer}, item {item_code}, "
+                f"barcode {barcode}. Correct the source prices before generating the PO."
+            )
+
+    # Blank barcodes cannot establish variant identity, so retain the older
+    # conservative description-and-price match for those records.
+    source["_blank_barcode_desc"] = source["รายละเอียดสินค้า"].where(
+        source["barcode"].eq(""), ""
+    )
+    source["_blank_barcode_price"] = source["หยวน"].where(
+        source["barcode"].eq(""), 0.0
+    )
     grouped = source.groupby(
         key_cols, as_index=False, dropna=False, sort=False
-    )[metric_cols].sum()
+    ).agg({
+        "รายละเอียดสินค้า": "first",
+        "ยอดขาย": "sum",
+        "สินค้าคงเหลือ": "sum",
+        "ON_ORDER": "sum",
+        "หยวน": "first",
+    })
     grouped.rename(columns=renamed, inplace=True)
-    grouped[f"หยวน_{label}"] = grouped["หยวน"]
     grouped[f"present_{label}"] = True
     return grouped[result_cols]
 
 
 def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: int, min_factor: int, max_factor: int) -> pd.DataFrame:
-    """Combine exact variants; keep differing barcodes, descriptions and prices separate."""
+    """Combine a supplier's item by barcode, preferring GREEN wording and price."""
     g_asia = _agg_one(df_asia, "ASIA")
     g_green = _agg_one(df_green, "GREEN")
-    key_cols = ["buyer", "รหัสสินค้า", "barcode", "รายละเอียดสินค้า", "หยวน"]
+    key_cols = [
+        "buyer", "รหัสสินค้า", "barcode", "_blank_barcode_desc", "_blank_barcode_price",
+    ]
     combined = pd.merge(g_asia, g_green, on=key_cols, how="outer", sort=False)
+
+    combined["รายละเอียดสินค้า"] = combined["รายละเอียดสินค้า_GREEN"].where(
+        combined["รายละเอียดสินค้า_GREEN"].fillna("").ne(""),
+        combined["รายละเอียดสินค้า_ASIA"],
+    ).fillna("")
+    green_price = pd.to_numeric(combined["หยวน_GREEN"], errors="coerce").astype(float)
+    asia_price = pd.to_numeric(combined["หยวน_ASIA"], errors="coerce").astype(float)
+    combined["หยวน"] = green_price.where(green_price.notna(), asia_price)
 
     # Keep the source barcode for catalog lookup. The printed PO barcode still
     # comes only from GREEN, as requested for column X.
@@ -639,7 +678,10 @@ def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: in
     combined["barcode"] = combined["barcode"].where(
         combined["present_GREEN"].eq(True), ""
     )
-    combined.drop(columns=["present_ASIA", "present_GREEN"], inplace=True)
+    combined.drop(columns=[
+        "present_ASIA", "present_GREEN", "_blank_barcode_desc", "_blank_barcode_price",
+        "รายละเอียดสินค้า_ASIA", "รายละเอียดสินค้า_GREEN",
+    ], inplace=True)
 
     for col in ["ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA",
                 "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN"]:
@@ -647,21 +689,8 @@ def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: in
 
     combined["ยอดขาย_TOTAL"] = combined["ยอดขาย_ASIA"] + combined["ยอดขาย_GREEN"]
     combined["ON_ORDER_TOTAL"] = combined["ON_ORDER_ASIA"] + combined["ON_ORDER_GREEN"]
-
-    def pick_yuan(row):
-        for source_col in ("หยวน_GREEN", "หยวน_ASIA"):
-            value = row.get(source_col, np.nan)
-            if pd.notna(value):
-                return float(value)
-        return np.nan
-
-    combined["หยวน"] = combined.apply(pick_yuan, axis=1)
-
-    if months <= 0:
-        months = 1
-
     combined["USE_MONTH"] = combined["ยอดขาย_TOTAL"].apply(
-        lambda value: round_half_up(value / months) if value > 0 else 0
+        lambda value: round_half_up(value / max(months, 1)) if value > 0 else 0
     )
     combined["TOTAL_QTY_NUM"] = (
         combined["STOCK_ASIA"] + combined["STOCK_GREEN"] + combined["ON_ORDER_TOTAL"]
@@ -1295,6 +1324,12 @@ def generate_po_from_combined(
             qty_per_carton_num = float(qty_per_carton) if qty_per_carton not in [None, ""] else 0.0
         except Exception:
             qty_per_carton_num = 0.0
+        if not math.isfinite(qty_per_carton_num) or qty_per_carton_num <= 0:
+            barcode_label = source_barcode or "(blank)"
+            raise ValueError(
+                f"Missing or invalid QTY PER CARTON for item {buyer_item}, "
+                f"barcode {barcode_label}. Add a positive carton quantity in the catalog."
+            )
 
         use_month = int(row["USE_MONTH"]) if not pd.isna(row["USE_MONTH"]) else 0
 
@@ -1306,9 +1341,7 @@ def generate_po_from_combined(
         if cat.get("img_bytes"):
             add_image_to_cell(ws, f"B{line}", cat["img_bytes"])
 
-        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = (
-            cat.get("goods_desc") or source_desc
-        )
+        ws.cell(line, po_cols["GOODS DESCRIPTION"]).value = source_desc
         barcode_cell = ws.cell(line, po_cols["BARCODE"])
         barcode_cell.value = po_barcode
         barcode_cell.number_format = "@"
@@ -1362,6 +1395,17 @@ def generate_po_from_combined(
 
         last_item_row = ITEM_START_ROW + len(combined_df) - 1
         force_bottom_border(ws, last_item_row, 1, PO_LAST_COL)
+
+        # openpyxl moves the template's total rows when items are inserted,
+        # but it does not update the formulas inside those rows.
+        for col in (col_cart, col_tot_order, col_amt):
+            ws[f"{col}{BASE_TOTAL_ROW}"] = (
+                f"=SUM({col}{ITEM_START_ROW}:{col}{last_item_row})"
+            )
+        ws[f"{col_amt}{BASE_TOTAL_ROW + 1}"] = float(rate_thb_per_cny)
+        ws[f"{col_amt}{BASE_TOTAL_ROW + 2}"] = (
+            f"={col_amt}{BASE_TOTAL_ROW}*{col_amt}{BASE_TOTAL_ROW + 1}"
+        )
 
         pos_thb = find_label_cell(ws, "TOTAL AMOUNT THB", max_row=400, max_col=60)
         if not pos_thb:

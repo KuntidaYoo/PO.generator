@@ -1,4 +1,4 @@
-"""Regression checks for distinct product variants in PO downloads."""
+"""Regression checks for barcode-based PO variants and downloads."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def make_barcode_catalog(path: Path, entries: list[dict]) -> None:
     ])
     for row_number, entry in enumerate(entries, start=2):
         ws.append([
-            "MC-510", None, entry["description"], entry.get("brand", "Brand"),
+            entry.get("code", "MC-510"), None, entry["description"], entry.get("brand", "Brand"),
             entry.get("material", "Steel"), entry.get("weight", 1),
             entry.get("carton", 10), None, entry.get("barcode", ""),
         ])
@@ -159,7 +159,7 @@ class POVariantTests(unittest.TestCase):
             }
             self.assertEqual(exported, set(zip(rows["barcode"], rows["รายละเอียดสินค้า"])))
 
-    def test_exact_match_and_variant_calculations_without_quantity_fanout(self) -> None:
+    def test_matching_barcode_combines_descriptions_and_prices_without_fanout(self) -> None:
         red = "ก็อกแฟนซีสี-แดง(R)"
         blue = "ก็อกแฟนซีสี-น้ำเงิน(LB)"
         asia = [
@@ -167,48 +167,33 @@ class POVariantTests(unittest.TestCase):
             source_row(red, barcode="", sales=3, stock=0, yuan=10),
         ]
         green = [
-            source_row(red, barcode="000123", sales=2, stock=3, yuan=10),
-            source_row(blue, barcode="000123", sales=12, stock=20, yuan=10),
+            source_row(red, barcode="000123", sales=2, stock=3, yuan=11),
+            source_row(blue, barcode="000123", sales=12, stock=20, yuan=11),
             source_row(red, barcode="000123", sales=5, stock=0, yuan=11),
         ]
 
         rows = combine(asia, green)
 
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 2)
         matching_red = rows[
             (rows["barcode"] == "000123")
             & (rows["รายละเอียดสินค้า"] == red)
-            & (rows["หยวน"] == 10)
+            & (rows["หยวน"] == 11)
         ].iloc[0]
         self.assertEqual(matching_red["ยอดขาย_ASIA"], 4)
-        self.assertEqual(matching_red["ยอดขาย_GREEN"], 2)
+        self.assertEqual(matching_red["ยอดขาย_GREEN"], 19)
         self.assertEqual(matching_red["STOCK_ASIA"], 1)
-        self.assertEqual(matching_red["STOCK_GREEN"], 3)
+        self.assertEqual(matching_red["STOCK_GREEN"], 23)
         self.assertEqual(matching_red["ON_ORDER_TOTAL"], 1)
-        self.assertEqual(matching_red["USE_MONTH"], 2)
-        self.assertEqual(matching_red["TOTAL_QTY_NUM"], 5)
-        self.assertEqual(matching_red["MIN_NUM"], 8)
-        self.assertEqual(matching_red["MAX_NUM"], 14)
-
-        blue_row = rows[rows["รายละเอียดสินค้า"] == blue].iloc[0]
-        self.assertEqual(blue_row["barcode"], "000123")
-        self.assertEqual(blue_row["ยอดขาย_ASIA"], 0)
-        self.assertEqual(blue_row["USE_MONTH"], 4)
-        self.assertEqual(blue_row["MIN_NUM"], 16)
-        self.assertEqual(blue_row["TOTAL_QTY_NUM"], 20)
+        self.assertEqual(matching_red["USE_MONTH"], 8)
+        self.assertEqual(matching_red["TOTAL_QTY_NUM"], 25)
+        self.assertEqual(matching_red["MIN_NUM"], 32)
+        self.assertEqual(matching_red["MAX_NUM"], 56)
 
         asia_only = rows[rows["barcode"] == ""].iloc[0]
         self.assertEqual(asia_only["ยอดขาย_ASIA"], 3)
         self.assertEqual(asia_only["ยอดขาย_GREEN"], 0)
         self.assertEqual(asia_only["STOCK_GREEN"], 0)
-
-        different_price = rows[
-            (rows["barcode"] == "000123")
-            & (rows["รายละเอียดสินค้า"] == red)
-            & (rows["หยวน"] == 11)
-        ].iloc[0]
-        self.assertEqual(different_price["ยอดขาย_ASIA"], 0)
-        self.assertEqual(different_price["ยอดขาย_GREEN"], 5)
 
     def test_asia_only_row_has_no_po_barcode_and_parser_keeps_leading_zero(self) -> None:
         parsed_green = parsed_sample_row("000123", "ก็อกแฟนซีสี-แดง(R)")
@@ -223,22 +208,130 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual(rows.iloc[0]["ยอดขาย_ASIA"], 6)
         self.assertEqual(rows.iloc[0]["ยอดขาย_GREEN"], 0)
 
-    def test_only_identical_source_records_aggregate(self) -> None:
+    def test_same_barcode_source_records_aggregate_with_first_description(self) -> None:
         green = [
             source_row("Red", barcode="0001", sales=2, stock=1, yuan=10),
-            source_row("Red", barcode="0001", sales=3, stock=4, yuan=10),
+            source_row("Red-MR", barcode="0001", sales=3, stock=4, yuan=10),
             source_row("Red", barcode="0002", sales=5, stock=6, yuan=10),
-            source_row("Red", barcode="0001", sales=7, stock=8, yuan=11),
+            source_row("Red-IR", barcode="0001", sales=7, stock=8, yuan=10),
         ]
 
         rows = combine([], green)
 
-        self.assertEqual(len(rows), 3)
-        identical = rows[(rows["barcode"] == "0001") & (rows["หยวน"] == 10)].iloc[0]
-        self.assertEqual(identical["ยอดขาย_GREEN"], 5)
-        self.assertEqual(identical["STOCK_GREEN"], 5)
+        self.assertEqual(len(rows), 2)
+        identical = rows[(rows["barcode"] == "0001")].iloc[0]
+        self.assertEqual(identical["รายละเอียดสินค้า"], "Red")
+        self.assertEqual(identical["ยอดขาย_GREEN"], 12)
+        self.assertEqual(identical["STOCK_GREEN"], 13)
         self.assertEqual(rows[rows["barcode"] == "0002"].iloc[0]["ยอดขาย_GREEN"], 5)
-        self.assertEqual(rows[rows["หยวน"] == 11].iloc[0]["ยอดขาย_GREEN"], 7)
+
+    def test_conflicting_prices_for_same_barcode_raise_clear_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"(?i)conflicting GREEN prices.*0001"):
+            combine([], [
+                source_row("Red", barcode="0001", yuan=10),
+                source_row("Red-MR", barcode="0001", yuan=11),
+            ])
+
+    def test_1g022_suffixes_and_blank_asia_prices_use_green_identity(self) -> None:
+        green_names = {
+            "A-1701C": "ก๊อกอ่างล้างหน้าแนวตั้งด้ามยก",
+            "A-1704K": "ก๊อกอ่างล้างหน้าด้ามยก-สีเทา",
+        }
+        barcodes = {"A-1701C": "0001701", "A-1704K": "0001704"}
+        prices = {"A-1701C": 29.69, "A-1704K": 33.81}
+        asia = [
+            source_row(green_names[code] + suffix, code=code,
+                       barcode=barcodes[code], sales=12, stock=2, yuan=float("nan"))
+            for code, suffix in (("A-1701C", "-MR"), ("A-1704K", "-IR"))
+        ]
+        green = [
+            source_row(name, code=code, barcode=barcodes[code],
+                       sales=15, stock=3, yuan=prices[code])
+            for code, name in green_names.items()
+        ]
+        rows = combine(asia, green)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue((rows["TOTAL_QTY_NUM"] < rows["MIN_NUM"]).all())
+        for code, name in green_names.items():
+            row = rows[rows["รหัสสินค้า"] == code].iloc[0]
+            self.assertEqual(row["รายละเอียดสินค้า"], name)
+            self.assertEqual(row["ยอดขาย_ASIA"], 12)
+            self.assertEqual(row["ยอดขาย_GREEN"], 15)
+            self.assertEqual(row["หยวน"], prices[code])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": code, "barcode": barcodes[code],
+                 "description": name + " catalog wording", "carton": 48}
+                for code, name in green_names.items()
+            ])
+            all_path = main.export_vendor_all_items_excel(rows, "A0029", out_folder=tmp)
+            all_ws = openpyxl.load_workbook(all_path)["all_items"]
+            self.assertEqual(all_ws.max_row, 3)
+            with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 27), 6,
+                    str(TEMPLATE), str(catalog_path),
+                    str(output / "missing_vendors.xlsx"), 4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            for row_number in (9, 10):
+                code = po[f"A{row_number}"].value
+                self.assertEqual(po[f"C{row_number}"].value, green_names[code])
+                self.assertEqual(po[f"X{row_number}"].value, barcodes[code])
+                self.assertEqual(po[f"L{row_number}"].value, prices[code])
+                self.assertEqual(po[f"G{row_number}"].value, 48)
+
+    def test_blank_barcodes_keep_different_descriptions_separate(self) -> None:
+        rows = combine(
+            [source_row("Red-MR", barcode="", sales=2)],
+            [source_row("Red", barcode="", sales=3)],
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(set(rows["รายละเอียดสินค้า"]), {"Red-MR", "Red"})
+        self.assertTrue((rows["barcode"] == "").all())
+
+    def test_totals_extend_past_template_item_rows(self) -> None:
+        rows = combine([], [
+            source_row(f"Variant {index}", barcode=f"000{index}", sales=3)
+            for index in range(1, 8)
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": f"000{index}", "description": f"Variant {index}", "carton": 10}
+                for index in range(1, 8)
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 27), 6,
+                    str(TEMPLATE), str(catalog_path),
+                    str(output / "missing_vendors.xlsx"), 4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            for column in ("H", "K", "N"):
+                self.assertEqual(po[f"{column}16"].value, f"=SUM({column}9:{column}15)")
+            self.assertEqual(po["N17"].value, 6)
+            self.assertEqual(po["N18"].value, "=N16*N17")
+
+    def test_missing_carton_quantity_raises_before_writing_division_formula(self) -> None:
+        rows = combine([], [source_row("Red", barcode="000123", sales=3)])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "000123", "description": "Red", "carton": None},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
+                with self.assertRaisesRegex(ValueError, r"QTY PER CARTON.*000123"):
+                    main.generate_po_from_combined(
+                        rows, "A0029", datetime.date(2026, 9, 27), 6,
+                        str(TEMPLATE), str(catalog_path),
+                        str(output / "missing_vendors.xlsx"), 4, 7,
+                    )
 
     def test_all_items_and_po_keep_leading_zero_barcode_as_text(self) -> None:
         description = "ก็อกแฟนซีสี-แดง(R)"
@@ -248,6 +341,10 @@ class POVariantTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"barcode": "000123", "description": description, "carton": 10},
+            ])
             all_items_path = main.export_vendor_all_items_excel(rows, "A0029", out_folder=str(output))
             all_items = openpyxl.load_workbook(all_items_path)["all_items"]
             headers = {all_items.cell(1, col).value: col for col in range(1, all_items.max_column + 1)}
@@ -262,7 +359,7 @@ class POVariantTests(unittest.TestCase):
                     datetime.date(2026, 9, 24),
                     6,
                     str(TEMPLATE),
-                    str(output / "missing_catalog.xlsx"),
+                    str(catalog_path),
                     str(output / "missing_vendors.xlsx"),
                     4,
                     7,
@@ -425,7 +522,7 @@ class POVariantTests(unittest.TestCase):
                             variant_counts_by_code={"MC-510": 2},
                         )
 
-    def test_catalog_barcode_selects_color_pictures_descriptions_and_metadata(self) -> None:
+    def test_catalog_barcode_selects_color_pictures_and_metadata(self) -> None:
         # Both Express rows have the same wording; only their GREEN barcodes
         # identify the different catalog colors and their different carton sizes.
         rows = combine(
@@ -463,13 +560,13 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(set(by_barcode), {"000123", "000456"})
             self.assertTrue(all(po[f"X{row}"].data_type == "s" for row in by_barcode.values()))
             expected = {
-                "000123": ("MC-510 ก๊อกแฟนซีสี-แดง(R)", "Red brand", "Red metal", 1.25, 12, (255, 0, 0)),
-                "000456": ("MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)", "Blue brand", "Blue metal", 2.5, 24, (0, 0, 255)),
+                "000123": ("Red brand", "Red metal", 1.25, 12, (255, 0, 0)),
+                "000456": ("Blue brand", "Blue metal", 2.5, 24, (0, 0, 255)),
             }
             pictures = item_picture_colors(po)
-            for barcode, (description, brand, material, weight, carton, color) in expected.items():
+            for barcode, (brand, material, weight, carton, color) in expected.items():
                 row = by_barcode[barcode]
-                self.assertEqual(po[f"C{row}"].value, description)
+                self.assertEqual(po[f"C{row}"].value, "MC-510 fancy faucet")
                 self.assertEqual(po[f"D{row}"].value, brand)
                 self.assertEqual(po[f"E{row}"].value, material)
                 self.assertEqual(po[f"F{row}"].value, weight)
@@ -593,17 +690,20 @@ class POVariantTests(unittest.TestCase):
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
             self.assertIsNone(po["X9"].value)
-            self.assertEqual(po["C9"].value, catalog_description)
+            self.assertEqual(po["C9"].value, rough_description)
             self.assertEqual(po["G9"].value, 12)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
-    def test_shared_source_barcode_does_not_assign_one_picture_to_two_descriptions(self) -> None:
+    def test_shared_source_barcode_combines_descriptions_and_uses_one_picture(self) -> None:
         red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
         blue = "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)"
         rows = combine([], [
             source_row(red, barcode="000123", sales=3),
             source_row(blue, barcode="000123", sales=3),
         ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["รายละเอียดสินค้า"], red)
+        self.assertEqual(rows.iloc[0]["ยอดขาย_GREEN"], 6)
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
             catalog_path = output / "catalog_with_barcodes.xlsx"
@@ -617,11 +717,9 @@ class POVariantTests(unittest.TestCase):
                     4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            descriptions = {po[f"C{row}"].value: row for row in (9, 10)}
-            self.assertEqual(set(descriptions), {red, blue})
-            self.assertEqual(po[f"X{descriptions[red]}"].value, "000123")
-            self.assertEqual(po[f"X{descriptions[blue]}"].value, "000123")
-            self.assertEqual(item_picture_colors(po), {descriptions[red]: (255, 0, 0)})
+            self.assertEqual(po["C9"].value, red)
+            self.assertEqual(po["X9"].value, "000123")
+            self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
     def test_duplicate_catalog_barcode_requires_unique_description_or_shared_carton(self) -> None:
         red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
