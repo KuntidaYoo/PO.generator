@@ -159,7 +159,7 @@ class POVariantTests(unittest.TestCase):
             }
             self.assertEqual(exported, set(zip(rows["barcode"], rows["รายละเอียดสินค้า"])))
 
-    def test_matching_barcode_combines_descriptions_and_prices_without_fanout(self) -> None:
+    def test_matching_barcode_combines_descriptions_and_same_source_missing_barcode(self) -> None:
         red = "ก็อกแฟนซีสี-แดง(R)"
         blue = "ก็อกแฟนซีสี-น้ำเงิน(LB)"
         asia = [
@@ -174,26 +174,21 @@ class POVariantTests(unittest.TestCase):
 
         rows = combine(asia, green)
 
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 1)
         matching_red = rows[
             (rows["barcode"] == "000123")
             & (rows["รายละเอียดสินค้า"] == red)
             & (rows["หยวน"] == 11)
         ].iloc[0]
-        self.assertEqual(matching_red["ยอดขาย_ASIA"], 4)
+        self.assertEqual(matching_red["ยอดขาย_ASIA"], 7)
         self.assertEqual(matching_red["ยอดขาย_GREEN"], 19)
         self.assertEqual(matching_red["STOCK_ASIA"], 1)
         self.assertEqual(matching_red["STOCK_GREEN"], 23)
         self.assertEqual(matching_red["ON_ORDER_TOTAL"], 1)
-        self.assertEqual(matching_red["USE_MONTH"], 8)
+        self.assertEqual(matching_red["USE_MONTH"], 9)
         self.assertEqual(matching_red["TOTAL_QTY_NUM"], 25)
-        self.assertEqual(matching_red["MIN_NUM"], 32)
-        self.assertEqual(matching_red["MAX_NUM"], 56)
-
-        asia_only = rows[rows["barcode"] == ""].iloc[0]
-        self.assertEqual(asia_only["ยอดขาย_ASIA"], 3)
-        self.assertEqual(asia_only["ยอดขาย_GREEN"], 0)
-        self.assertEqual(asia_only["STOCK_GREEN"], 0)
+        self.assertEqual(matching_red["MIN_NUM"], 36)
+        self.assertEqual(matching_red["MAX_NUM"], 63)
 
     def test_asia_only_row_has_no_po_barcode_and_parser_keeps_leading_zero(self) -> None:
         parsed_green = parsed_sample_row("000123", "ก็อกแฟนซีสี-แดง(R)")
@@ -228,9 +223,30 @@ class POVariantTests(unittest.TestCase):
     def test_conflicting_prices_for_same_barcode_raise_clear_error(self) -> None:
         with self.assertRaisesRegex(ValueError, r"(?i)conflicting GREEN prices.*0001"):
             combine([], [
-                source_row("Red", barcode="0001", yuan=10),
-                source_row("Red-MR", barcode="0001", yuan=11),
+                source_row("Red", barcode="0001", sales=2, yuan=10),
+                source_row("Red-MR", barcode="0001", sales=3, yuan=11),
             ])
+
+    def test_inactive_duplicate_price_does_not_override_active_variant(self) -> None:
+        rows = combine([], [
+            source_row("ก๊อกสนามคอยาววาล์วเซรามิค 1/2", barcode="8858778308567",
+                       code="MC401-2L", sales=1647, yuan=8.04),
+            source_row("ก็อกสนามคอยาววาล์วเซรามิค B", barcode="8858778308567",
+                       code="MC401-2L", yuan=6.19),
+        ])
+        self.assertEqual(len(rows), 1)
+        row = rows.iloc[0]
+        self.assertEqual(row["หยวน"], 8.04)
+        self.assertEqual(row["ยอดขาย_GREEN"], 1647)
+        self.assertEqual(row["รายละเอียดสินค้า"], "ก๊อกสนามคอยาววาล์วเซรามิค 1/2")
+
+    def test_conflicting_inactive_prices_leave_price_blank(self) -> None:
+        rows = combine([], [
+            source_row("Same", barcode="0001", yuan=10),
+            source_row("Same-MR", barcode="0001", yuan=11),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(pd.isna(rows.iloc[0]["หยวน"]))
 
     def test_1g022_suffixes_and_blank_asia_prices_use_green_identity(self) -> None:
         green_names = {
@@ -284,14 +300,217 @@ class POVariantTests(unittest.TestCase):
                 self.assertEqual(po[f"L{row_number}"].value, prices[code])
                 self.assertEqual(po[f"G{row_number}"].value, 48)
 
-    def test_blank_barcodes_keep_different_descriptions_separate(self) -> None:
+    def test_blank_barcodes_match_after_ignoring_source_marker(self) -> None:
         rows = combine(
             [source_row("Red-MR", barcode="", sales=2)],
             [source_row("Red", barcode="", sales=3)],
         )
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(set(rows["รายละเอียดสินค้า"]), {"Red-MR", "Red"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["รายละเอียดสินค้า"], "Red")
+        self.assertEqual(rows.iloc[0]["ยอดขาย_TOTAL"], 5)
         self.assertTrue((rows["barcode"] == "").all())
+
+    def test_blank_barcodes_preserve_different_color_descriptions(self) -> None:
+        rows = combine(
+            [source_row("CBS-320 สีแดง", barcode="", code="CBS-320", sales=2)],
+            [source_row("CBS-320 สีเขียว", barcode="", code="CBS-320", sales=3)],
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(set(rows["รายละเอียดสินค้า"]), {"CBS-320 สีแดง", "CBS-320 สีเขียว"})
+
+    def test_missing_asia_barcode_merges_unique_green_name(self) -> None:
+        name = "ก๊อกอ่างล้างหน้าแนวตั้งด้ามยก"
+        rows = combine(
+            [source_row(name + "-MR", barcode="", code="A-1701C", sales=9, stock=2,
+                        yuan=float("nan"))],
+            [source_row(name, barcode="0001701", code="A-1701C", sales=12, stock=3,
+                        yuan=29.69)],
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows.iloc[0]
+        self.assertEqual(row["barcode"], "0001701")
+        self.assertEqual(row["catalog_match_barcode"], "0001701")
+        self.assertEqual(row["รายละเอียดสินค้า"], name)
+        self.assertEqual((row["ยอดขาย_ASIA"], row["ยอดขาย_GREEN"]), (9, 12))
+        self.assertEqual((row["STOCK_ASIA"], row["STOCK_GREEN"]), (2, 3))
+        self.assertEqual(row["หยวน"], 29.69)
+
+    def test_missing_green_barcode_uses_asia_barcode_only_for_catalog(self) -> None:
+        name = "ก๊อกอ่างล้างหน้าด้ามยก-สีเทา"
+        rows = combine(
+            [source_row(name + "-IR", barcode="0001704", code="A-1704K", sales=2)],
+            [source_row(name, barcode="", code="A-1704-K", sales=3)],
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows.iloc[0]
+        self.assertEqual(row["รหัสสินค้า"], "A-1704-K")
+        self.assertEqual(row["barcode"], "")
+        self.assertEqual(row["catalog_match_barcode"], "0001704")
+        self.assertEqual(row["ยอดขาย_TOTAL"], 5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "A-1704-K", "barcode": "0001704", "description": name,
+                 "carton": 48},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 27), 6,
+                    str(TEMPLATE), str(catalog_path),
+                    str(output / "missing_vendors.xlsx"), 4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertEqual(po["A9"].value, "A-1704-K")
+            self.assertEqual(po["C9"].value, name)
+            self.assertEqual(po["G9"].value, 48)
+            self.assertIn(po["X9"].value, (None, ""))
+
+    def test_item_code_parenthetical_color_is_part_of_variant_identity(self) -> None:
+        rows = combine(
+            [source_row("CBS-320 สีแดง", barcode="", code="CBS-320(R)", sales=2)],
+            [source_row("CBS-320 สีเขียว", barcode="", code="CBS-320(G)", sales=3)],
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(set(rows["รหัสสินค้า"]), {"CBS-320(R)", "CBS-320(G)"})
+        self.assertEqual(set(rows["ยอดขาย_TOTAL"]), {2, 3})
+
+    def test_blank_barcode_cannot_fan_out_to_multiple_color_variants(self) -> None:
+        name = "CBS-320 same wording"
+        rows = combine(
+            [source_row(name, barcode="", code="CBS-320", sales=2)],
+            [source_row(name, barcode="0001", code="CBS-320", sales=3),
+             source_row(name, barcode="0002", code="CBS-320", sales=4)],
+        )
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sorted(rows["ยอดขาย_TOTAL"].tolist()), [2, 3, 4])
+
+    def test_different_populated_barcodes_never_merge_by_name(self) -> None:
+        name = "CBS-320 same wording"
+        rows = combine(
+            [source_row(name, barcode="0001", code="CBS-320", sales=2)],
+            [source_row(name, barcode="0002", code="CBS-320", sales=3)],
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(rows["ยอดขาย_TOTAL"].tolist()), [2, 3])
+
+    def test_conflicting_prices_for_blank_barcode_variant_raise(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"(?i)conflicting GREEN prices"):
+            combine([], [
+                source_row("Gray-IR", barcode="", code="A-1704K", sales=2, yuan=10),
+                source_row("Gray", barcode="", code="A-1704-K", sales=3, yuan=11),
+            ])
+
+    def test_parser_keeps_thai_parenthetical_color_in_code(self) -> None:
+        parsed = parsed_sample_row("000123", "ก๊อกสีเขียว")
+        self.assertEqual(parsed["รหัสสินค้า"], "MC-510")
+        code, description = main.split_product_field(
+            "01-22-1085-E1-1 MC-501(เขียว) ก๊อกแฟนซีสีเขียว"
+        )
+        self.assertEqual(code, "MC-501(เขียว)")
+        self.assertEqual(description, "ก๊อกแฟนซีสีเขียว")
+
+        code, description = main.split_product_field(
+            "01-22-1085-E1-1 A-75-2(ชุดสายฉีดชำระ-ขา DM-948) สายฉีดชำระ"
+        )
+        self.assertEqual(code, "A-75-2(ชุดสายฉีดชำระ-ขา DM-948)")
+        self.assertEqual(description, "สายฉีดชำระ")
+        code, description = main.split_product_field(
+            "01-25-2117 SL-3305C(H)-CRหัวฝักบัวสีแดง"
+        )
+        self.assertEqual(code, "SL-3305C(H)-CR")
+        self.assertEqual(description, "หัวฝักบัวสีแดง")
+
+    def test_trailing_period_barcode_and_parenthetical_code_from_express(self) -> None:
+        line = (
+            "1G022 8858778325991. } 01-25-2117 BM-120(WS) "
+            "สายอ่อนฝักบัวเยอรมัน-สีดำ 120CM. 2.00 71.20 2.00 71.20 0.00"
+        )
+        with (
+            patch.object(main, "extract_5_6_block_from_money_chunk", return_value=[0.0] * 6),
+            patch.object(main, "extract_yuan_after_money_block", return_value=1.0),
+        ):
+            fields = main.parse_line_to_fields(pd.Series(dtype=object), line)
+        self.assertIsNotNone(fields)
+        self.assertEqual(fields["barcode"], "8858778325991")
+        code, description = main.split_product_field(fields["สินค้า"])
+        self.assertEqual(code, "BM-120(WS)")
+        self.assertTrue(description.startswith("สายอ่อนฝักบัว"))
+        self.assertEqual(main.normalize_barcode("8858778325991."), "8858778325991")
+        self.assertEqual(main.normalize_barcode("1234567."), "1234567.")
+        code, description = main.split_product_field(
+            "01-22-1085-E1-1 MC-501(เขียว)ก๊อกแฟนซีสีเขียว"
+        )
+        self.assertEqual(code, "MC-501(เขียว)")
+        self.assertEqual(description, "ก๊อกแฟนซีสีเขียว")
+
+    def test_missing_barcode_in_same_source_attaches_to_unique_variant(self) -> None:
+        rows = combine([], [
+            source_row("CBS-320 สีแดง", barcode="0001", code="CBS-320", sales=2,
+                       stock=1, yuan=10),
+            source_row("CBS-320 สีแดง-MR", barcode="", code="CBS-320", sales=3,
+                       stock=4, yuan=10),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["barcode"], "0001")
+        self.assertEqual(rows.iloc[0]["ยอดขาย_GREEN"], 5)
+        self.assertEqual(rows.iloc[0]["STOCK_GREEN"], 5)
+        self.assertEqual(rows.iloc[0]["รายละเอียดสินค้า"], "CBS-320 สีแดง")
+
+        reverse_rows = combine([], [
+            source_row("CBS-320 สีแดง-MR", barcode="", code="CBS-320", sales=3,
+                       stock=4, yuan=10),
+            source_row("CBS-320 สีแดง", barcode="0001", code="CBS-320", sales=2,
+                       stock=1, yuan=10),
+        ])
+        self.assertEqual(len(reverse_rows), 1)
+        self.assertEqual(reverse_rows.iloc[0]["รายละเอียดสินค้า"], "CBS-320 สีแดง")
+        self.assertEqual(reverse_rows.iloc[0]["ยอดขาย_GREEN"], 5)
+
+    def test_unique_barcode_matches_across_different_express_codes(self) -> None:
+        rows = combine(
+            [source_row("ASIA set description", barcode="000155", code="A-155(ชุด)",
+                        sales=2)],
+            [source_row("GREEN product wording", barcode="000155", code="A-155",
+                        sales=3)],
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows.iloc[0]
+        self.assertEqual(row["รหัสสินค้า"], "A-155")
+        self.assertEqual(row["รายละเอียดสินค้า"], "GREEN product wording")
+        self.assertEqual(row["barcode"], "000155")
+        self.assertEqual(row["ยอดขาย_TOTAL"], 5)
+
+        color_code_rows = combine(
+            [source_row("Tap red", barcode="000320", code="CBS-320(R)", sales=2)],
+            [source_row("Tap red", barcode="000320", code="CBS-320", sales=3)],
+        )
+        self.assertEqual(len(color_code_rows), 1)
+        self.assertEqual(color_code_rows.iloc[0]["ยอดขาย_TOTAL"], 5)
+
+        set_rows = combine(
+            [source_row("Set description", barcode="2024113600127",
+                        code="A-155(ชุดท่อน้ำทิ้ง+สะดือ8นิ้ว)", sales=3741)],
+            [source_row("Green wording", barcode="2024113600127", code="A-155",
+                        sales=914)],
+        )
+        self.assertEqual(len(set_rows), 1)
+        self.assertEqual(set_rows.iloc[0]["ยอดขาย_TOTAL"], 4655)
+
+    def test_missing_barcode_in_same_source_does_not_fan_out(self) -> None:
+        rows = combine([], [
+            source_row("CBS-320 สีแดง", barcode="0001", code="CBS-320", sales=2),
+            source_row("CBS-320 สีแดง", barcode="0002", code="CBS-320", sales=3),
+            source_row("CBS-320 สีแดง-MR", barcode="", code="CBS-320", sales=4),
+        ])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sorted(rows["ยอดขาย_GREEN"].tolist()), [2, 3, 4])
+        self.assertEqual(sorted(rows["barcode"].tolist()), ["", "0001", "0002"])
+
+    def test_missing_normalization_values_are_blank(self) -> None:
+        self.assertEqual(main.normalize_item_code(float("nan")), "")
+        self.assertEqual(main.normalize_product_description(float("nan")), "")
 
     def test_totals_extend_past_template_item_rows(self) -> None:
         rows = combine([], [
@@ -846,6 +1065,90 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(selected["weight"], 501)
             self.assertEqual(selected["qty_per_carton"], 48)
             self.assertIsNone(selected["img_bytes"])
+
+    def test_catalog_name_fallback_handles_code_punctuation_and_source_marker(self) -> None:
+        name = "ก๊อกอ่างล้างหน้าด้ามยก-สีเทา"
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "A-1704-K", "barcode": "", "description": name,
+                 "carton": 48, "picture_color": "red"},
+            ])
+            catalog = main.build_catalog_map(str(catalog_path), "A0029")
+            selected = main.resolve_catalog_variant(
+                catalog, "A-1704K", name + "-IR", 1, barcode="0001704"
+            )
+            self.assertEqual(selected["qty_per_carton"], 48)
+            self.assertIsNotNone(selected["img_bytes"])
+
+    def test_catalog_name_fallback_when_source_barcode_missing(self) -> None:
+        red = "CBS-320 สีแดง(R)"
+        blue = "CBS-320 สีฟ้า(LB)"
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "CBS-320", "barcode": "0001", "description": red,
+                 "carton": 12, "picture_color": "red"},
+                {"code": "CBS-320", "barcode": "0002", "description": blue,
+                 "carton": 24, "picture_color": "blue"},
+            ])
+            catalog = main.build_catalog_map(str(catalog_path), "A0029")
+            selected = main.resolve_catalog_variant(
+                catalog, "CBS-320", red + "-MR", 2, barcode=""
+            )
+            self.assertEqual(selected["qty_per_carton"], 12)
+            self.assertIsNotNone(selected["img_bytes"])
+
+    def test_unique_catalog_code_fallback_with_different_wording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "A-1704-K", "barcode": "", "description": "older catalog wording",
+                 "carton": 48},
+            ])
+            catalog = main.build_catalog_map(str(catalog_path), "A0029")
+            selected = main.resolve_catalog_variant(
+                catalog, "A-1704K", "ก๊อกอ่างล้างหน้าด้ามยก-สีเทา", 1,
+                barcode="0001704"
+            )
+            self.assertEqual(selected["qty_per_carton"], 48)
+
+    def test_catalog_conflicting_barcode_blocks_name_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "A-1704-K", "barcode": "0009999", "description": "Gray",
+                 "carton": 48},
+            ])
+            catalog = main.build_catalog_map(str(catalog_path), "A0029")
+            with self.assertRaisesRegex(ValueError, r"(?i)No catalog BARCODE match"):
+                main.resolve_catalog_variant(
+                    catalog, "A-1704K", "Gray", 1, barcode="0001704"
+                )
+
+    def test_alias_codes_share_variant_count_for_catalog_safety(self) -> None:
+        rows = combine([], [
+            source_row("Gray", code="A-1704K", barcode="0001", sales=3),
+            source_row("Blue", code="A-1704-K", barcode="0002", sales=4),
+        ])
+        self.assertEqual(len(rows), 2)
+        by_code, _, _ = main.catalog_variant_counts(rows, "catalog_match_barcode")
+        self.assertEqual(by_code, {"a1704k": 2})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            catalog_path = output / "catalog.xlsx"
+            make_barcode_catalog(catalog_path, [
+                {"code": "A-1704-K", "barcode": "", "description": "old wording",
+                 "carton": 48},
+            ])
+            with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
+                with self.assertRaisesRegex(ValueError, r"(?i)Ambiguous catalog variant"):
+                    main.generate_po_from_combined(
+                        rows, "A0029", datetime.date(2026, 9, 27), 6,
+                        str(TEMPLATE), str(catalog_path),
+                        str(output / "missing_vendors.xlsx"), 4, 7,
+                    )
 
 
 if __name__ == "__main__":

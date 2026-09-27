@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import unicodedata
 import datetime
 from typing import List, Dict, Optional, Tuple
 from copy import copy as _copy
@@ -272,6 +273,7 @@ def split_product_field(s: str) -> Tuple[str, str]:
         t2 = re.sub(r'^[Nn][Oo](?=[A-Za-z0-9])', '', t).strip()
         if not t2:
             return False
+        t2 = re.sub(r"\([^()]*\)$", "", t2)
         if re.fullmatch(r"[A-Za-z]{1,6}[A-Za-z0-9]*-[A-Za-z0-9]+", t2):
             return True
         if re.fullmatch(r"[A-Za-z]{1,6}\d+[A-Za-z0-9]*", t2):
@@ -279,6 +281,22 @@ def split_product_field(s: str) -> Tuple[str, str]:
         if re.fullmatch(r"[A-Za-z]{2,5}", t2):  # e.g. NRW
             return True
         return False
+
+    # A parenthetical suffix can contain Thai words and spaces. Capture the
+    # full code before searching for the first Thai character in the line.
+    rest_tokens = rest.split()
+    while rest_tokens and is_doc_token(rest_tokens[0]):
+        rest_tokens = rest_tokens[1:]
+    code_with_suffix = re.match(
+        r"^(?P<code>(?:[Nn][Oo])?[A-Za-z]{1,6}[A-Za-z0-9]*(?:-[A-Za-z0-9]+)*\([^()]*\)(?:-?[A-Za-z0-9]+)*)(?P<description>.*)$",
+        " ".join(rest_tokens),
+    )
+    if code_with_suffix:
+        code = re.sub(r"^[Nn][Oo](?=[A-Za-z0-9])", "", code_with_suffix.group("code"))
+        return code, code_with_suffix.group("description").strip()
+    if rest_tokens and is_product_code(rest_tokens[0]):
+        code = re.sub(r"^[Nn][Oo](?=[A-Za-z0-9])", "", rest_tokens[0]).strip()
+        return code, " ".join(rest_tokens[1:]).strip()
 
     m_th = re.search(r"[\u0E00-\u0E7F]", rest)
     if m_th:
@@ -514,8 +532,8 @@ def parse_line_to_fields(row: pd.Series, merged_line: str) -> Optional[Dict[str,
 
     barcode = ""
     idx = 0
-    if idx < len(tokens) and re.fullmatch(r"\d+", tokens[idx] or ""):
-        barcode = tokens[idx]
+    if idx < len(tokens) and re.fullmatch(r"\d+|\d{8,}\.", tokens[idx] or ""):
+        barcode = normalize_barcode(tokens[idx])
         idx += 1
 
     product_str = strip_report_values(" ".join(tokens[idx:]))
@@ -597,94 +615,256 @@ def parse_express_file(path: str, source_label: str) -> Tuple[pd.DataFrame, Dict
 # =========================
 # COMBINE + AGG
 # =========================
+def normalize_item_code(value) -> str:
+    """Treat punctuation variants as one code; retain parenthetical variants."""
+    if value is None or pd.isna(value):
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANS)
+    return re.sub(r"[\s-]+", "", text).casefold()
+
+
+def normalize_product_description(value) -> str:
+    """Ignore Express source markers but preserve color, size, and model wording."""
+    if value is None or pd.isna(value):
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANS)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?:\s*-\s*(?:IR|MR)\s*)+$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[-]\s*", "-", text).strip()
+    return text.casefold()
+
+
+def catalog_variant_counts(df: pd.DataFrame, barcode_col: str) -> tuple[dict, dict, dict]:
+    """Count every supplier variant under normalized code and description keys."""
+    by_code = {}
+    by_code_description = {}
+    barcode_descriptions = {}
+    for _, row in df.iterrows():
+        code = normalize_item_code(row.get("รหัสสินค้า"))
+        description = normalize_product_description(row.get("รายละเอียดสินค้า"))
+        barcode = normalize_barcode(row.get(barcode_col))
+        by_code[code] = by_code.get(code, 0) + 1
+        code_description = (code, description)
+        by_code_description[code_description] = by_code_description.get(code_description, 0) + 1
+        barcode_descriptions.setdefault((code, barcode), set()).add(description)
+    return (
+        by_code,
+        by_code_description,
+        {key: len(values) for key, values in barcode_descriptions.items()},
+    )
+
+
+def normalize_variant_count_keys(counts: dict, key_kind: str) -> dict:
+    """Accept caller-provided counts using either raw or normalized item codes."""
+    normalized = {}
+    for key, count in counts.items():
+        if key_kind == "code":
+            new_key = normalize_item_code(key)
+        elif key_kind == "description":
+            new_key = (normalize_item_code(key[0]), normalize_product_description(key[1]))
+        else:
+            new_key = (normalize_item_code(key[0]), normalize_barcode(key[1]))
+        normalized[new_key] = normalized.get(new_key, 0) + int(count)
+    return normalized
+
+
 def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Sum each source by barcode; use description and price only without one."""
-    key_cols = [
-        "buyer", "รหัสสินค้า", "barcode", "_blank_barcode_desc", "_blank_barcode_price",
+    """Sum each source by item-code variant and barcode, or name when blank."""
+    columns = [
+        "buyer", "รหัสสินค้า", "_norm_code", "barcode", "_norm_desc",
+        f"รายละเอียดสินค้า_{label}", f"ยอดขาย_{label}", f"STOCK_{label}",
+        f"ON_ORDER_{label}", f"หยวน_{label}",
     ]
-    metric_cols = ["ยอดขาย", "สินค้าคงเหลือ", "ON_ORDER"]
-    renamed = {
-        "รายละเอียดสินค้า": f"รายละเอียดสินค้า_{label}",
-        "ยอดขาย": f"ยอดขาย_{label}",
-        "สินค้าคงเหลือ": f"STOCK_{label}",
-        "ON_ORDER": f"ON_ORDER_{label}",
-        "หยวน": f"หยวน_{label}",
-    }
-    result_cols = key_cols + list(renamed.values()) + [f"present_{label}"]
     if df.empty:
-        return pd.DataFrame(columns=result_cols)
+        return pd.DataFrame(columns=columns)
 
     source = df.copy()
-    for col in ["buyer", "รหัสสินค้า", "รายละเอียดสินค้า"]:
+    for col in ("buyer", "รหัสสินค้า", "รายละเอียดสินค้า"):
         source[col] = source[col].fillna("").astype(str).str.strip()
+    source["buyer"] = source["buyer"].str.upper()
     source["barcode"] = source["barcode"].map(normalize_barcode)
+    source["_barcode_originally_present"] = source["barcode"].ne("")
+    source["_norm_code"] = source["รหัสสินค้า"].map(normalize_item_code)
+    source["_norm_desc"] = source["รายละเอียดสินค้า"].map(normalize_product_description)
+
+    # Attach a blank-barcode line to an existing barcoded variant in the same
+    # source only when normalized code and description point to one barcode.
+    # Two barcodes with the same name remain separate; the blank line stays
+    # separate as well because there is no safe one-to-one assignment.
+    known_barcodes = source[source["barcode"].ne("")].groupby(
+        ["buyer", "_norm_code", "_norm_desc"], sort=False, dropna=False
+    )["barcode"].agg(lambda values: set(values)).to_dict()
+    for index in source.index[source["barcode"].eq("")]:
+        key = (source.at[index, "buyer"], source.at[index, "_norm_code"],
+               source.at[index, "_norm_desc"])
+        options = known_barcodes.get(key, set())
+        if len(options) == 1 and key[2]:
+            source.at[index, "barcode"] = next(iter(options))
+
+    source["_group_desc"] = source["_norm_desc"].where(source["barcode"].eq(""), "")
     source["หยวน"] = pd.to_numeric(source["หยวน"], errors="coerce")
-    for col in metric_cols:
+    for col in ("ยอดขาย", "สินค้าคงเหลือ", "ON_ORDER"):
         source[col] = pd.to_numeric(source[col], errors="coerce").fillna(0.0)
+    source["_active"] = source[["ยอดขาย", "สินค้าคงเหลือ", "ON_ORDER"]].ne(0).any(axis=1)
+    # Active wording wins; among equally active rows, use the one that supplied
+    # the barcode before a blank row later attached to it.
+    source = source.sort_values(
+        ["_active", "_barcode_originally_present"],
+        ascending=[False, False],
+        kind="stable",
+    )
 
-    # One barcode must not silently choose between conflicting nonblank prices.
-    with_barcode = source[source["barcode"].ne("")]
-    for (buyer, item_code, barcode), prices in with_barcode.groupby(
-        ["buyer", "รหัสสินค้า", "barcode"], sort=False
-    )["หยวน"]:
-        if prices.nunique(dropna=True) > 1:
+    keys = ["buyer", "_norm_code", "barcode", "_group_desc"]
+    source["_selected_price"] = np.nan
+    for group_key, group in source.groupby(keys, sort=False, dropna=False):
+        active_prices = group.loc[group["_active"], "หยวน"].dropna().unique()
+        all_prices = group["หยวน"].dropna().unique()
+        if len(active_prices) > 1:
+            buyer, _, barcode, _ = group_key
+            code = group["รหัสสินค้า"].iloc[0]
             raise ValueError(
-                f"Conflicting {label} prices for supplier {buyer}, item {item_code}, "
-                f"barcode {barcode}. Correct the source prices before generating the PO."
+                f"Conflicting {label} prices for supplier {buyer}, item {code}, "
+                f"barcode {barcode or '(blank)'}. Correct the source prices before generating the PO."
             )
+        if len(active_prices) == 1:
+            selected_price = active_prices[0]
+        elif len(all_prices) == 1:
+            selected_price = all_prices[0]
+        else:
+            selected_price = np.nan
+        source.loc[group.index, "_selected_price"] = selected_price
 
-    # Blank barcodes cannot establish variant identity, so retain the older
-    # conservative description-and-price match for those records.
-    source["_blank_barcode_desc"] = source["รายละเอียดสินค้า"].where(
-        source["barcode"].eq(""), ""
-    )
-    source["_blank_barcode_price"] = source["หยวน"].where(
-        source["barcode"].eq(""), 0.0
-    )
-    grouped = source.groupby(
-        key_cols, as_index=False, dropna=False, sort=False
-    ).agg({
+    grouped = source.groupby(keys, as_index=False, dropna=False, sort=False).agg({
+        "รหัสสินค้า": "first",
+        "_norm_desc": "first",
         "รายละเอียดสินค้า": "first",
         "ยอดขาย": "sum",
         "สินค้าคงเหลือ": "sum",
         "ON_ORDER": "sum",
-        "หยวน": "first",
+        "_selected_price": "first",
     })
-    grouped.rename(columns=renamed, inplace=True)
-    grouped[f"present_{label}"] = True
-    return grouped[result_cols]
+    grouped.rename(columns={
+        "รายละเอียดสินค้า": f"รายละเอียดสินค้า_{label}",
+        "ยอดขาย": f"ยอดขาย_{label}",
+        "สินค้าคงเหลือ": f"STOCK_{label}",
+        "ON_ORDER": f"ON_ORDER_{label}",
+        "_selected_price": f"หยวน_{label}",
+    }, inplace=True)
+    return grouped[columns]
 
 
-def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: int, min_factor: int, max_factor: int) -> pd.DataFrame:
-    """Combine a supplier's item by barcode, preferring GREEN wording and price."""
-    g_asia = _agg_one(df_asia, "ASIA")
-    g_green = _agg_one(df_green, "GREEN")
-    key_cols = [
-        "buyer", "รหัสสินค้า", "barcode", "_blank_barcode_desc", "_blank_barcode_price",
-    ]
-    combined = pd.merge(g_asia, g_green, on=key_cols, how="outer", sort=False)
+def build_combined_all(
+    df_asia: pd.DataFrame,
+    df_green: pd.DataFrame,
+    months: int,
+    min_factor: int,
+    max_factor: int,
+) -> pd.DataFrame:
+    """Match barcodes first, then uniquely matching names for missing barcodes."""
+    asia = _agg_one(df_asia, "ASIA").to_dict("records")
+    green = _agg_one(df_green, "GREEN").to_dict("records")
+    matches = {}
+    used_green = set()
 
-    combined["รายละเอียดสินค้า"] = combined["รายละเอียดสินค้า_GREEN"].where(
-        combined["รายละเอียดสินค้า_GREEN"].fillna("").ne(""),
-        combined["รายละเอียดสินค้า_ASIA"],
-    ).fillna("")
-    green_price = pd.to_numeric(combined["หยวน_GREEN"], errors="coerce").astype(float)
-    asia_price = pd.to_numeric(combined["หยวน_ASIA"], errors="coerce").astype(float)
-    combined["หยวน"] = green_price.where(green_price.notna(), asia_price)
+    # A matching barcode on the same normalized code is the strongest identity.
+    for ai, a in enumerate(asia):
+        if not a["barcode"]:
+            continue
+        candidates = [
+            gi for gi, g in enumerate(green)
+            if gi not in used_green
+            and a["buyer"] == g["buyer"]
+            and a["_norm_code"] == g["_norm_code"]
+            and a["barcode"] == g["barcode"]
+        ]
+        if len(candidates) == 1:
+            matches[ai] = candidates[0]
+            used_green.add(candidates[0])
 
-    # Keep the source barcode for catalog lookup. The printed PO barcode still
-    # comes only from GREEN, as requested for column X.
-    combined["catalog_match_barcode"] = combined["barcode"]
-    combined["barcode"] = combined["barcode"].where(
-        combined["present_GREEN"].eq(True), ""
-    )
-    combined.drop(columns=[
-        "present_ASIA", "present_GREEN", "_blank_barcode_desc", "_blank_barcode_price",
-        "รายละเอียดสินค้า_ASIA", "รายละเอียดสินค้า_GREEN",
-    ], inplace=True)
+    # If Express codes differ, a vendor-wide barcode can still identify the
+    # same variant when it appears exactly once in each source.
+    for ai, a in enumerate(asia):
+        if ai in matches or not a["barcode"]:
+            continue
+        same_asia_barcode = [
+            item for item in asia if item["buyer"] == a["buyer"] and item["barcode"] == a["barcode"]
+        ]
+        candidates = [
+            gi for gi, g in enumerate(green)
+            if gi not in used_green
+            and g["buyer"] == a["buyer"]
+            and g["barcode"] == a["barcode"]
+        ]
+        same_green_barcode = [
+            item for item in green if item["buyer"] == a["buyer"] and item["barcode"] == a["barcode"]
+        ]
+        if len(same_asia_barcode) == len(same_green_barcode) == len(candidates) == 1:
+            matches[ai] = candidates[0]
+            used_green.add(candidates[0])
 
-    for col in ["ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA",
-                "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN"]:
+    # Name matching is a fallback only if at least one source barcode is blank.
+    # Require a one-to-one match so one blank row cannot fan out to colors.
+    for ai, a in enumerate(asia):
+        if ai in matches or not a["_norm_desc"]:
+            continue
+        candidates = [
+            gi for gi, g in enumerate(green)
+            if gi not in used_green
+            and g["buyer"] == a["buyer"]
+            and g["_norm_code"] == a["_norm_code"]
+            and g["_norm_desc"] == a["_norm_desc"]
+            and (not a["barcode"] or not g["barcode"])
+        ]
+        if len(candidates) != 1:
+            continue
+        gi = candidates[0]
+        g = green[gi]
+        reverse = [
+            other_ai for other_ai, other in enumerate(asia)
+            if other_ai not in matches
+            and other["buyer"] == g["buyer"]
+            and other["_norm_code"] == g["_norm_code"]
+            and other["_norm_desc"] == g["_norm_desc"]
+            and (not other["barcode"] or not g["barcode"])
+        ]
+        if len(reverse) == 1:
+            matches[ai] = gi
+            used_green.add(gi)
+
+    records = []
+    pairs = [(a, green[matches[ai]] if ai in matches else None) for ai, a in enumerate(asia)]
+    pairs.extend((None, g) for gi, g in enumerate(green) if gi not in used_green)
+    for a, g in pairs:
+        chosen = g if g is not None else a
+        green_barcode = g["barcode"] if g is not None else ""
+        source_barcode = green_barcode or (a["barcode"] if a is not None else "")
+        green_price = g.get("หยวน_GREEN", np.nan) if g is not None else np.nan
+        asia_price = a.get("หยวน_ASIA", np.nan) if a is not None else np.nan
+        record = {
+            "buyer": chosen["buyer"],
+            "รหัสสินค้า": chosen["รหัสสินค้า"],
+            "รายละเอียดสินค้า": (
+                g["รายละเอียดสินค้า_GREEN"] if g is not None
+                else a["รายละเอียดสินค้า_ASIA"]
+            ),
+            "barcode": green_barcode,
+            "catalog_match_barcode": source_barcode,
+            "หยวน_ASIA": asia_price,
+            "หยวน_GREEN": green_price,
+            "หยวน": green_price if pd.notna(green_price) else asia_price,
+        }
+        for label, item in (("ASIA", a), ("GREEN", g)):
+            for col in (f"ยอดขาย_{label}", f"STOCK_{label}", f"ON_ORDER_{label}"):
+                record[col] = item[col] if item is not None else 0.0
+        records.append(record)
+
+    combined = pd.DataFrame(records, columns=[
+        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "barcode", "catalog_match_barcode",
+        "ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA", "หยวน_ASIA",
+        "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN", "หยวน_GREEN", "หยวน",
+    ])
+    for col in ("ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA",
+                "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN"):
         combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0.0)
 
     combined["ยอดขาย_TOTAL"] = combined["ยอดขาย_ASIA"] + combined["ยอดขาย_GREEN"]
@@ -734,6 +914,9 @@ def normalize_barcode(value, number_format: str = "") -> str:
     else:
         barcode = str(value)
     barcode = re.sub(r"\s+", "", barcode)
+    trailing_period = re.fullmatch(r"(\d{8,})\.", barcode)
+    if trailing_period:
+        barcode = trailing_period.group(1)
     fmt = str(number_format or "").strip()
     if barcode.isdigit() and re.fullmatch(r"0+", fmt):
         barcode = barcode.zfill(len(fmt))
@@ -746,6 +929,7 @@ class CatalogMap(dict):
     def __init__(self):
         super().__init__()
         self.by_barcode = {}
+        self.by_norm_code = {}
 
 
 def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
@@ -806,10 +990,12 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
             "weight": ws.cell(r, COL_WEIGHT).value,
             "qty_per_carton": ws.cell(r, COL_QTYCT).value,
             "barcode": barcode,
+            "item_code": item_no,
             "img_bytes": img_at.get((r, COL_PIC)),
         }
         if item_no:
             catalog.setdefault(item_no, []).append(entry)
+            catalog.by_norm_code.setdefault(normalize_item_code(item_no), []).append(entry)
         if barcode:
             catalog.by_barcode.setdefault(barcode, []).append(entry)
     return catalog
@@ -825,7 +1011,16 @@ def resolve_catalog_variant(
     barcode_description_count: int = 1,
 ) -> dict:
     """Match barcode across the vendor sheet, then use safe code fallbacks."""
-    entries = catalog_map.get(item_code, [])
+    normalized_code = normalize_item_code(item_code)
+    normalized_index = getattr(catalog_map, "by_norm_code", None)
+    if normalized_index is not None:
+        entries = normalized_index.get(normalized_code, [])
+    else:
+        entries = [
+            entry for code, code_entries in catalog_map.items()
+            if normalize_item_code(code) == normalized_code
+            for entry in code_entries
+        ]
     source_barcode = normalize_barcode(barcode)
     if source_barcode:
         barcode_index = getattr(catalog_map, "by_barcode", None)
@@ -851,13 +1046,11 @@ def resolve_catalog_variant(
             )
         return {}
 
-    normalized_desc = re.sub(r"\s+", " ", str(description or "")).strip().casefold()
+    normalized_desc = normalize_product_description(description)
 
     def same_description(entry):
-        return (
-            bool(normalized_desc)
-            and re.sub(r"\s+", " ", str(entry.get("goods_desc") or "")).strip().casefold()
-            == normalized_desc
+        return bool(normalized_desc) and (
+            normalize_product_description(entry.get("goods_desc")) == normalized_desc
         )
 
     selected = None
@@ -904,6 +1097,13 @@ def resolve_catalog_variant(
 
     if selected is not None:
         return selected.copy()
+
+    if len(candidates) == 1:
+        raise ValueError(
+            f"Ambiguous catalog variant for item {item_code} ({description}). "
+            "Multiple source variants share the normalized item code, and this "
+            "catalog row has no unique matching barcode or description."
+        )
 
     resolved = {}
     for field in ("brand", "material", "weight", "qty_per_carton"):
@@ -1300,20 +1500,24 @@ def generate_po_from_combined(
         r, c = pos
         ws.cell(r, c + 1).value = supplier_addr
 
-    if variant_counts_by_code is None:
-        variant_counts_by_code = combined_df.groupby("รหัสสินค้า").size().to_dict()
-    if variant_counts_by_code_description is None:
-        variant_counts_by_code_description = combined_df.groupby(
-            ["รหัสสินค้า", "รายละเอียดสินค้า"]
-        ).size().to_dict()
     match_barcode_col = (
         "catalog_match_barcode"
         if "catalog_match_barcode" in combined_df.columns else "barcode"
     )
-    if barcode_description_counts is None:
-        barcode_description_counts = combined_df.groupby(
-            ["รหัสสินค้า", match_barcode_col]
-        )["รายละเอียดสินค้า"].nunique().to_dict()
+    fallback_counts = catalog_variant_counts(combined_df, match_barcode_col)
+    variant_counts_by_code = normalize_variant_count_keys(
+        variant_counts_by_code if variant_counts_by_code is not None else fallback_counts[0],
+        "code",
+    )
+    variant_counts_by_code_description = normalize_variant_count_keys(
+        variant_counts_by_code_description
+        if variant_counts_by_code_description is not None else fallback_counts[1],
+        "description",
+    )
+    barcode_description_counts = normalize_variant_count_keys(
+        barcode_description_counts if barcode_description_counts is not None else fallback_counts[2],
+        "barcode",
+    )
 
     combined_df = combined_df.sort_values(
         by=["รหัสสินค้า", "รายละเอียดสินค้า", "barcode"],
@@ -1344,15 +1548,17 @@ def generate_po_from_combined(
         source_desc = str(row.get("รายละเอียดสินค้า") or "").strip()
         po_barcode = normalize_barcode(row.get("barcode", ""))
         source_barcode = normalize_barcode(row.get(match_barcode_col, ""))
+        count_code = normalize_item_code(buyer_item)
+        count_description = normalize_product_description(source_desc)
         cat = resolve_catalog_variant(
             catalog_map,
             buyer_item,
             source_desc,
-            variant_counts_by_code.get(buyer_item, 1),
-            variant_counts_by_code_description.get((buyer_item, source_desc), 1),
+            variant_counts_by_code.get(count_code, 1),
+            variant_counts_by_code_description.get((count_code, count_description), 1),
             barcode=source_barcode,
             barcode_description_count=barcode_description_counts.get(
-                (buyer_item, source_barcode), 1
+                (count_code, source_barcode), 1
             ),
         )
 
@@ -1581,6 +1787,9 @@ def generate_po_streamlit(
 
     path_filtered = None
     if not vendor_rows_filtered.empty:
+        count_by_code, count_by_description, count_by_barcode_description = (
+            catalog_variant_counts(vendor_rows_all, "catalog_match_barcode")
+        )
         path_filtered = generate_po_from_combined(
             combined_df=vendor_rows_filtered,
             vendor_code=vendor_code,
@@ -1591,13 +1800,9 @@ def generate_po_streamlit(
             vendor_info_path=vendor_info_path,
             min_factor=int(min_factor),
             max_factor=int(max_factor),
-            variant_counts_by_code=vendor_rows_all.groupby("รหัสสินค้า").size().to_dict(),
-            variant_counts_by_code_description=vendor_rows_all.groupby(
-                ["รหัสสินค้า", "รายละเอียดสินค้า"]
-            ).size().to_dict(),
-            barcode_description_counts=vendor_rows_all.groupby(
-                ["รหัสสินค้า", "catalog_match_barcode"]
-            )["รายละเอียดสินค้า"].nunique().to_dict(),
+            variant_counts_by_code=count_by_code,
+            variant_counts_by_code_description=count_by_description,
+            barcode_description_counts=count_by_barcode_description,
         )
 
     return {
