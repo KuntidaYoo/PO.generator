@@ -624,14 +624,133 @@ def normalize_item_code(value) -> str:
 
 
 def normalize_product_description(value) -> str:
-    """Ignore Express source markers but preserve color, size, and model wording."""
+    """Remove Express source tags without changing product variant wording."""
     if value is None or pd.isna(value):
         return ""
     text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANS)
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"(?:\s*-\s*(?:IR|MR)\s*)+$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*[-]\s*", "-", text).strip()
+    text = re.sub(
+        r"(?:[\s/,-]+(?:IR|MR|FN|VN|OEM))+(?:[\s/,-]*)$",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s*-\s*", "-", text).strip().rstrip("/").strip()
     return text.casefold()
+
+
+_COLOR_NAMES = {
+    "น้ำเงิน": "blue", "น้ำตาล": "brown", "เขียว": "green", "แดง": "red",
+    "ขาว": "white", "ดำ": "black", "เทา": "gray", "ฟ้า": "lightblue",
+    "ชมพู": "pink", "เหลือง": "yellow", "ส้ม": "orange", "ม่วง": "purple",
+    "เงิน": "silver", "ทอง": "gold", "งา": "ivory",
+    "ครีมงาช้าง": "ivory", "งาช้าง": "ivory", "ครีม": "ivory",
+    "light blue": "lightblue", "dark blue": "darkblue", "lightblue": "lightblue",
+    "red": "red", "blue": "blue", "green": "green", "white": "white",
+    "black": "black", "grey": "gray", "gray": "gray", "brown": "brown",
+    "pink": "pink", "yellow": "yellow", "orange": "orange", "purple": "purple",
+    "silver": "silver", "gold": "gold", "ivory": "ivory", "cream": "ivory",
+}
+# Match dictionaries use the same normalization as descriptions. Thai sara am
+# (ำ) decomposes under NFKC, including in ดำ, น้ำเงิน and น้ำตาล.
+for _name, _canonical in list(_COLOR_NAMES.items()):
+    if not _name.isascii():
+        for _shade, _suffix in (("เข้ม", "dark"), ("อ่อน", "light"), ("พาสเทล", "pastel")):
+            _COLOR_NAMES[_name + _shade] = _canonical + "-" + _suffix
+_COLOR_NAMES = {unicodedata.normalize("NFKC", name): color for name, color in _COLOR_NAMES.items()}
+_COLOR_PATTERN = re.compile(
+    "|".join(
+        (r"(?<![a-z])" + re.escape(name) + r"(?![a-z])") if name.isascii()
+        else (r"(?<![ก-๙])งา(?![ก-๙])|(?<=สี)งา" if name == "งา" else re.escape(name))
+        for name in sorted(_COLOR_NAMES, key=len, reverse=True)
+    )
+)
+_STYLE_NAMES = {
+    "ด้ามสั้น": "short-handle", "ด้ามยาว": "long-handle",
+    "คอสั้น": "short-neck", "คอยาว": "long-neck",
+    "รุ่นใหญ่": "large", "รุ่นเล็ก": "small",
+    "ขนาดใหญ่": "large", "ขนาดเล็ก": "small",
+    "วงรี": "oval", "กลม": "round", "เหลี่ยม": "square",
+    "รุ่นมาตรฐาน": "standard", "standard": "standard",
+    "ดีลัก": "deluxe", "deluxe": "deluxe", "block": "block",
+    "ซาติน": "satin", "ซาต": "satin", "satin": "satin",
+    "เงา": "gloss", "glossy": "gloss", "ด้าน": "matte", "matte": "matte",
+}
+_STYLE_NAMES = {unicodedata.normalize("NFKC", name): style for name, style in _STYLE_NAMES.items()}
+_NUMBER = r"(?:\d+\s*[- ]\s*\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)"
+_SIZE_PATTERN = re.compile(
+    r"#?\s*" + _NUMBER + r"(?:\s*[x×*]\s*" + _NUMBER + r"){0,2}"
+    r"(?:\s*(?:mm\.?|cm\.?|inch(?:es)?|in\b|มม\.?|ซม\.?|นิ้ว|เมตร|ฟุต|[\"″]))?"
+)
+
+
+def product_variant_signature(description, item_code="") -> tuple:
+    """Code is the legacy identity; retain explicit colors, sizes and styles.
+
+    Trailing name/report wording does not create another item. Variant details
+    may occur on either side of a space, so truncating at the first space would
+    erase real colors and dimensions. The original display text is untouched.
+    """
+    text = normalize_product_description(description)
+    parts = text.split(maxsplit=1)
+    if parts and normalize_item_code(parts[0]) == normalize_item_code(item_code):
+        text = parts[1] if len(parts) > 1 else ""
+    colors = {_COLOR_NAMES[match.group()] for match in _COLOR_PATTERN.finditer(text)}
+    styles = {canonical for word, canonical in _STYLE_NAMES.items() if word in text}
+    # Some Express names end halfway through a color. Infer a color only when
+    # its prefix identifies one choice; retain uncertain prefixes as variants.
+    color_tokens = re.findall(r"สี\s*-?\s*([ก-๙]+)|(?<![ก-๙])(น้ํา[ก-๙]+)", text)
+    for explicit, standalone in color_tokens:
+        token = explicit or standalone
+        if any(token.startswith(name) for name in _COLOR_NAMES):
+            continue
+        if any(token.startswith(word) for word in _STYLE_NAMES):
+            continue
+        simple = re.sub(r"[\u0e31\u0e34-\u0e3a\u0e47-\u0e4e]", "", token)
+        options = {
+            color for name, color in _COLOR_NAMES.items()
+            if not name.isascii() and re.sub(
+                r"[\u0e31\u0e34-\u0e3a\u0e47-\u0e4e]", "", name
+            ).startswith(simple)
+        }
+        # Shade suffixes do not turn a unique base color into many options.
+        options = {color.split("-")[0] for color in options}
+        colors.add(next(iter(options)) if len(options) == 1 else "partial:" + token)
+    for model in re.findall(r"(?:รุ่น|model)\s*([a-z][a-z0-9-]*)", text):
+        styles.add("model:" + model.rstrip("-"))
+    # A whole product and a separately sold component are real variants,
+    # rather than incomplete descriptions of each other.
+    if unicodedata.normalize("NFKC", "ฝักบัวชำระ") in text:
+        head_only = "เฉพาะหัว" in text or "หัวอย่างเดียว" in text
+        styles.add("head-only" if head_only else "complete")
+    if "อ่างล้างหน้า" in text:
+        styles.add("with-legs" if "พร้อมขา" in text else "without-legs")
+    color_codes = {"r": "red", "g": "green", "b": "blue", "lb": "lightblue"}
+    for parenthetical in re.findall(r"\(([^()]*)\)", text):
+        if parenthetical in color_codes:
+            # LB identifies the light-blue option even when its Thai name says
+            # น้ำเงิน rather than ฟ้า. Keep other conflicting color details.
+            if parenthetical == "lb":
+                colors.discard("blue")
+            colors.add(color_codes[parenthetical])
+        elif not _COLOR_PATTERN.search(parenthetical) and parenthetical:
+            styles.add(parenthetical)
+    sizes = set()
+    for match in _SIZE_PATTERN.finditer(text):
+        size = match.group().strip().replace("×", "x").replace("*", "x")
+        size = re.sub(r"(?<=\d)[ -]+(?=\d+\s*/)", "+", size)
+        size = re.sub(r"\s+", "", size)
+        size = re.sub(r'(?:inch(?:es)?|นิ้ว|["″])$', "in", size)
+        size = re.sub(r"(?:มม|mm)\.?$", "mm", size)
+        size = re.sub(r"(?:ซม|cm)\.?$", "cm", size)
+        size = re.sub(r"\d+\.\d+", lambda number: (
+            str(int(number.group().split(".")[0])) + "." + number.group().split(".")[1].rstrip("0")
+        ).rstrip("."), size)
+        sizes.add(size)
+    return tuple(sorted(colors)), tuple(sorted(sizes)), tuple(sorted(styles))
+
+
+def variants_compatible(left: tuple, right: tuple) -> bool:
+    """A missing detail may match one variant; explicit differences may not."""
+    return all(not a or not b or a == b for a, b in zip(left, right))
 
 
 def catalog_variant_counts(df: pd.DataFrame, barcode_col: str) -> tuple[dict, dict, dict]:
@@ -668,10 +787,10 @@ def normalize_variant_count_keys(counts: dict, key_kind: str) -> dict:
     return normalized
 
 
-def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Sum each source by item-code variant and barcode, or name when blank."""
+def _agg_one(df: pd.DataFrame, label: str, variant_context: Optional[dict] = None) -> pd.DataFrame:
+    """Sum barcode variants, with legacy code/variant fallback when blank."""
     columns = [
-        "buyer", "รหัสสินค้า", "_norm_code", "barcode", "_norm_desc",
+        "buyer", "รหัสสินค้า", "_norm_code", "barcode", "_norm_desc", "_variant_key",
         f"รายละเอียดสินค้า_{label}", f"ยอดขาย_{label}", f"STOCK_{label}",
         f"ON_ORDER_{label}", f"หยวน_{label}",
     ]
@@ -687,21 +806,56 @@ def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
     source["_norm_code"] = source["รหัสสินค้า"].map(normalize_item_code)
     source["_norm_desc"] = source["รายละเอียดสินค้า"].map(normalize_product_description)
 
-    # Attach a blank-barcode line to an existing barcoded variant in the same
-    # source only when normalized code and description point to one barcode.
-    # Two barcodes with the same name remain separate; the blank line stays
-    # separate as well because there is no safe one-to-one assignment.
+    source["_variant_key"] = [
+        product_variant_signature(description, code)
+        for description, code in zip(source["รายละเอียดสินค้า"], source["รหัสสินค้า"])
+    ]
+    # Without an item code there is no legacy code identity. Preserve the full
+    # normalized name so unrelated uncoded products cannot collapse together.
+    for index in source.index[source["_norm_code"].eq("")]:
+        signature = source.at[index, "_variant_key"]
+        name = source.at[index, "_norm_desc"] or f"unknown-row-{index}"
+        source.at[index, "_variant_key"] = signature[:2] + (
+            signature[2] + ("description:" + name,),
+        )
+    variants_by_code = variant_context if variant_context is not None else source.groupby(
+        ["buyer", "_norm_code"], sort=False
+    )["_variant_key"].agg(lambda values: set(values)).to_dict()
+    # Complete truncated descriptions only when one explicit variant fits.
+    # A plain/unknown row stays separate when several colors or sizes fit.
+    for index in source.index[source["barcode"].eq("")]:
+        key = (source.at[index, "buyer"], source.at[index, "_norm_code"])
+        variant = source.at[index, "_variant_key"]
+        if not key[1]:
+            continue
+        options = [
+            other for other in variants_by_code.get(key, {variant})
+            if all(not a or a == b for a, b in zip(variant, other))
+        ]
+        fullest = [
+            other for other in options
+            if not any(
+                other != candidate and all(not a or a == b for a, b in zip(other, candidate))
+                for candidate in options
+            )
+        ]
+        if len(fullest) == 1:
+            source.at[index, "_variant_key"] = fullest[0]
+
     known_barcodes = source[source["barcode"].ne("")].groupby(
-        ["buyer", "_norm_code", "_norm_desc"], sort=False, dropna=False
+        ["buyer", "_norm_code", "_variant_key"], sort=False, dropna=False
     )["barcode"].agg(lambda values: set(values)).to_dict()
     for index in source.index[source["barcode"].eq("")]:
         key = (source.at[index, "buyer"], source.at[index, "_norm_code"],
-               source.at[index, "_norm_desc"])
+               source.at[index, "_variant_key"])
         options = known_barcodes.get(key, set())
-        if len(options) == 1 and key[2]:
+        if len(options) == 1:
             source.at[index, "barcode"] = next(iter(options))
 
-    source["_group_desc"] = source["_norm_desc"].where(source["barcode"].eq(""), "")
+    source["_group_desc"] = [
+        variant if not barcode else ()
+        for variant, barcode in zip(source["_variant_key"], source["barcode"])
+    ]
     source["หยวน"] = pd.to_numeric(source["หยวน"], errors="coerce")
     for col in ("ยอดขาย", "สินค้าคงเหลือ", "ON_ORDER"):
         source[col] = pd.to_numeric(source[col], errors="coerce").fillna(0.0)
@@ -719,16 +873,18 @@ def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
     for group_key, group in source.groupby(keys, sort=False, dropna=False):
         active_prices = group.loc[group["_active"], "หยวน"].dropna().unique()
         all_prices = group["หยวน"].dropna().unique()
-        if len(active_prices) > 1:
+        # Missing-barcode groups retain the legacy first available price.
+        # Populated barcodes still identify one variant with one active price.
+        if len(active_prices) > 1 and group_key[2]:
             buyer, _, barcode, _ = group_key
             code = group["รหัสสินค้า"].iloc[0]
             raise ValueError(
                 f"Conflicting {label} prices for supplier {buyer}, item {code}, "
                 f"barcode {barcode or '(blank)'}. Correct the source prices before generating the PO."
             )
-        if len(active_prices) == 1:
+        if len(active_prices) >= 1:
             selected_price = active_prices[0]
-        elif len(all_prices) == 1:
+        elif len(all_prices) == 1 or (len(all_prices) and not group_key[2]):
             selected_price = all_prices[0]
         else:
             selected_price = np.nan
@@ -737,6 +893,7 @@ def _agg_one(df: pd.DataFrame, label: str) -> pd.DataFrame:
     grouped = source.groupby(keys, as_index=False, dropna=False, sort=False).agg({
         "รหัสสินค้า": "first",
         "_norm_desc": "first",
+        "_variant_key": "first",
         "รายละเอียดสินค้า": "first",
         "ยอดขาย": "sum",
         "สินค้าคงเหลือ": "sum",
@@ -760,9 +917,24 @@ def build_combined_all(
     min_factor: int,
     max_factor: int,
 ) -> pd.DataFrame:
-    """Match barcodes first, then uniquely matching names for missing barcodes."""
-    asia = _agg_one(df_asia, "ASIA").to_dict("records")
-    green = _agg_one(df_green, "GREEN").to_dict("records")
+    """Match barcodes first, then legacy item codes with compatible variants."""
+    # Use both files when deciding whether missing variant details are unique.
+    # Otherwise a colorless ASIA row could be assigned red before GREEN's white
+    # option is seen.
+    variant_context = {}
+    for frame in (df_asia, df_green):
+        for _, row in frame.iterrows():
+            code = normalize_item_code(row.get("รหัสสินค้า"))
+            if not code:
+                continue
+            buyer = "" if pd.isna(row["buyer"]) else str(row["buyer"]).strip().upper()
+            key = (buyer, code)
+            variant_context.setdefault(key, set()).add(product_variant_signature(
+                row.get("รายละเอียดสินค้า"), row.get("รหัสสินค้า")
+            ))
+    # Uncoded rows already use full names and do not infer variant details.
+    asia = _agg_one(df_asia, "ASIA", variant_context).to_dict("records")
+    green = _agg_one(df_green, "GREEN", variant_context).to_dict("records")
     matches = {}
     used_green = set()
 
@@ -802,34 +974,32 @@ def build_combined_all(
             matches[ai] = candidates[0]
             used_green.add(candidates[0])
 
-    # Name matching is a fallback only if at least one source barcode is blank.
-    # Require a one-to-one match so one blank row cannot fan out to colors.
-    for ai, a in enumerate(asia):
-        if ai in matches or not a["_norm_desc"]:
-            continue
-        candidates = [
-            gi for gi, g in enumerate(green)
-            if gi not in used_green
-            and g["buyer"] == a["buyer"]
-            and g["_norm_code"] == a["_norm_code"]
-            and g["_norm_desc"] == a["_norm_desc"]
-            and (not a["barcode"] or not g["barcode"])
-        ]
-        if len(candidates) != 1:
-            continue
-        gi = candidates[0]
-        g = green[gi]
-        reverse = [
-            other_ai for other_ai, other in enumerate(asia)
-            if other_ai not in matches
-            and other["buyer"] == g["buyer"]
-            and other["_norm_code"] == g["_norm_code"]
-            and other["_norm_desc"] == g["_norm_desc"]
-            and (not other["barcode"] or not g["barcode"])
-        ]
-        if len(reverse) == 1:
-            matches[ai] = gi
-            used_green.add(gi)
+    # Exact variant matches precede partial/truncated matches. Barcode-less
+    # wording differences no longer produce two lines for the same product.
+    for exact_only in (True, False):
+        for ai, a in enumerate(asia):
+            if ai in matches:
+                continue
+
+            def eligible(other, candidate):
+                return (
+                    other["buyer"] == candidate["buyer"]
+                    and other["_norm_code"] == candidate["_norm_code"]
+                    and (not other["barcode"] or not candidate["barcode"])
+                    and (other["_variant_key"] == candidate["_variant_key"] if exact_only
+                         else variants_compatible(other["_variant_key"], candidate["_variant_key"]))
+                )
+
+            # Count all original choices, including already matched rows, so
+            # processing order cannot make an ambiguous missing color unique.
+            candidates = [gi for gi, g in enumerate(green) if eligible(a, g)]
+            if len(candidates) != 1 or candidates[0] in used_green:
+                continue
+            gi = candidates[0]
+            reverse = [other_ai for other_ai, other in enumerate(asia) if eligible(other, green[gi])]
+            if len(reverse) == 1:
+                matches[ai] = gi
+                used_green.add(gi)
 
     records = []
     pairs = [(a, green[matches[ai]] if ai in matches else None) for ai, a in enumerate(asia)]
@@ -1010,7 +1180,12 @@ def resolve_catalog_variant(
     barcode: str = "",
     barcode_description_count: int = 1,
 ) -> dict:
-    """Match barcode across the vendor sheet, then use safe code fallbacks."""
+    """Prefer barcodes; missing barcodes use the March item-code fallback.
+
+    A description/variant match improves legacy selection. If none is available,
+    the last eligible worksheet row wins, as in the pre-barcode catalog map.
+    Source variant counts no longer block a code fallback.
+    """
     normalized_code = normalize_item_code(item_code)
     normalized_index = getattr(catalog_map, "by_norm_code", None)
     if normalized_index is not None:
@@ -1022,89 +1197,48 @@ def resolve_catalog_variant(
             for entry in code_entries
         ]
     source_barcode = normalize_barcode(barcode)
-    if source_barcode:
-        barcode_index = getattr(catalog_map, "by_barcode", None)
-        barcode_matches = (
-            barcode_index.get(source_barcode, [])
-            if barcode_index is not None else [
-                entry for code_entries in catalog_map.values()
-                for entry in code_entries
-                if normalize_barcode(entry.get("barcode")) == source_barcode
-            ]
+    barcode_index = getattr(catalog_map, "by_barcode", None)
+    barcode_matches = (
+        barcode_index.get(source_barcode, []) if barcode_index is not None else [
+            entry for code_entries in catalog_map.values()
+            for entry in code_entries
+            if source_barcode and normalize_barcode(entry.get("barcode")) == source_barcode
+        ]
+    ) if source_barcode else []
+    if len(barcode_matches) == 1:
+        return barcode_matches[0].copy()
+    if not barcode_matches:
+        # A blank catalog barcode is eligible for the old lookup even during
+        # a partial update. Two different populated barcodes remain distinct.
+        eligible = (
+            [entry for entry in entries if not normalize_barcode(entry.get("barcode"))]
+            if source_barcode else entries
         )
-        # A unique barcode identifies the catalog row even if column A has a typo.
-        if len(barcode_matches) == 1:
-            return barcode_matches[0].copy()
-    else:
-        barcode_matches = []
-    if not barcode_matches and not entries:
-        if source_barcode and (catalog_map or getattr(catalog_map, "by_barcode", None)):
-            raise ValueError(
-                f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
-                "QTY PER CARTON cannot be verified. "
-                "Add this barcode in catalog column I."
-            )
-        return {}
-
-    normalized_desc = normalize_product_description(description)
-
-    def same_description(entry):
-        return bool(normalized_desc) and (
-            normalize_product_description(entry.get("goods_desc")) == normalized_desc
-        )
-
-    selected = None
-    candidates = entries
-    if source_barcode:
-        if barcode_matches:
-            # Duplicate barcodes cannot identify a picture, even when one
-            # description looks closer. Keep only fields shared by every row.
-            candidates = barcode_matches
-        elif not any(entry.get("barcode") for entry in entries):
-            # Older catalogs do not have barcodes; keep the description lookup.
-            exact = [entry for entry in entries if same_description(entry)]
-            candidates = exact if exact else entries
-            if len(exact) == 1 and description_variant_count == 1:
-                selected = exact[0]
-            elif not exact and len(entries) == 1 and variant_count == 1:
-                selected = entries[0].copy()
-                selected["goods_desc"] = None
-        else:
-            # During a partial catalog update, a blank-barcode row can still
-            # match by its exact description. Never borrow a populated row
-            # whose barcode identifies a different variant.
-            blank_matches = [
-                entry for entry in entries
-                if not entry.get("barcode") and same_description(entry)
-            ]
-            if len(blank_matches) == 1 and description_variant_count == 1:
-                selected = blank_matches[0]
-            else:
+        if not eligible:
+            if source_barcode and (catalog_map or barcode_index):
                 raise ValueError(
                     f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
                     "QTY PER CARTON cannot be verified from another variant. "
-                    "Add this barcode in catalog column I or match one blank-barcode "
-                    "catalog description to the source description."
+                    "Add this barcode in catalog column I or leave the matching item-code "
+                    "row's barcode blank to use the legacy lookup."
                 )
-    else:
-        exact = [entry for entry in entries if same_description(entry)]
-        candidates = exact if exact else entries
-        if len(exact) == 1 and description_variant_count == 1:
-            selected = exact[0]
-        elif not exact and len(entries) == 1 and variant_count == 1:
-            selected = entries[0].copy()
-            selected["goods_desc"] = None
+            return {}
+        normalized_desc = normalize_product_description(description)
+        exact = [
+            entry for entry in eligible if normalized_desc and
+            normalize_product_description(entry.get("goods_desc")) == normalized_desc
+        ]
+        if exact:
+            return exact[-1].copy()
+        signature = product_variant_signature(description, item_code)
+        variants = [
+            entry for entry in eligible if any(signature) and
+            product_variant_signature(entry.get("goods_desc"), item_code) == signature
+        ]
+        return (variants or eligible)[-1].copy()
 
-    if selected is not None:
-        return selected.copy()
-
-    if len(candidates) == 1:
-        raise ValueError(
-            f"Ambiguous catalog variant for item {item_code} ({description}). "
-            "Multiple source variants share the normalized item code, and this "
-            "catalog row has no unique matching barcode or description."
-        )
-
+    # Duplicate populated barcodes keep only fields common to all matching rows.
+    candidates = barcode_matches
     resolved = {}
     for field in ("brand", "material", "weight", "qty_per_carton"):
         values = [entry.get(field) for entry in candidates]

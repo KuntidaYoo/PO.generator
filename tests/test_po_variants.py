@@ -395,12 +395,14 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(rows["ยอดขาย_TOTAL"].tolist()), [2, 3])
 
-    def test_conflicting_prices_for_blank_barcode_variant_raise(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"(?i)conflicting GREEN prices"):
-            combine([], [
-                source_row("Gray-IR", barcode="", code="A-1704K", sales=2, yuan=10),
-                source_row("Gray", barcode="", code="A-1704-K", sales=3, yuan=11),
-            ])
+    def test_blank_barcode_variant_keeps_legacy_first_price(self) -> None:
+        rows = combine([], [
+            source_row("Gray-IR", barcode="", code="A-1704K", sales=2, yuan=10),
+            source_row("Gray", barcode="", code="A-1704-K", sales=3, yuan=11),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["หยวน"], 10)
+        self.assertEqual(rows.iloc[0]["ยอดขาย_TOTAL"], 5)
 
     def test_parser_keeps_thai_parenthetical_color_in_code(self) -> None:
         parsed = parsed_sample_row("000123", "ก๊อกสีเขียว")
@@ -685,7 +687,7 @@ class POVariantTests(unittest.TestCase):
                 expected_color = (255, 0, 0) if po[f"C{row}"].value == red else (0, 0, 255)
                 self.assertEqual(selected[row], expected_color)
 
-    def test_ambiguous_catalog_image_is_blank(self) -> None:
+    def test_legacy_catalog_image_uses_last_code_row(self) -> None:
         rows = combine(
             [],
             [source_row("ก็อกแฟนซีสี-แดง(R)", barcode="000123", sales=3)],
@@ -713,33 +715,27 @@ class POVariantTests(unittest.TestCase):
                 if getattr(getattr(image.anchor, "_from", None), "row", None) == 8
                 and getattr(getattr(image.anchor, "_from", None), "col", None) == 1
             ]
-            self.assertEqual(item_images, [])
+            self.assertEqual(len(item_images), 1)
+            color = PILImage.open(BytesIO(item_images[0]._data())).convert("RGB").getpixel((0, 0))
+            self.assertEqual(color, (0, 0, 255))
             self.assertEqual(po["G9"].value, 10)
 
-    def test_conflicting_catalog_carton_quantity_raises_clear_error(self) -> None:
-        rows = combine(
-            [],
-            [source_row("ก็อกแฟนซีสี-แดง(R)", barcode="000123", sales=3)],
-        )
+    def test_legacy_catalog_uses_last_code_rows_carton_quantity(self) -> None:
+        rows = combine([], [source_row("ก็อกแฟนซีสี-แดง(R)", barcode="000123", sales=3)])
         for quantities in ((10, 20), (None, 10)):
             with self.subTest(carton_quantities=quantities), tempfile.TemporaryDirectory() as tmp:
                 output = Path(tmp)
                 catalog_path = output / "catalog.xlsx"
                 make_catalog(catalog_path, quantities, images=False)
                 with patch.object(main, "PO_OUTPUT_FOLDER", str(output)):
-                    with self.assertRaisesRegex((ValueError, RuntimeError), r"(?i)carton"):
-                        main.generate_po_from_combined(
-                            rows,
-                            "A0029",
-                            datetime.date(2026, 9, 24),
-                            6,
-                            str(TEMPLATE),
-                            str(catalog_path),
-                            str(output / "missing_vendors.xlsx"),
-                            4,
-                            7,
-                            variant_counts_by_code={"MC-510": 2},
-                        )
+                    po_path = main.generate_po_from_combined(
+                        rows, "A0029", datetime.date(2026, 9, 24), 6,
+                        str(TEMPLATE), str(catalog_path), str(output / "missing_vendors.xlsx"),
+                        4, 7, variant_counts_by_code={"MC-510": 2},
+                    )
+                po = openpyxl.load_workbook(po_path)["PO"]
+                self.assertEqual(po["G9"].value, quantities[-1])
+                self.assertEqual(po["X9"].value, "000123")
 
     def test_catalog_barcode_selects_color_pictures_and_metadata(self) -> None:
         # Both Express rows have the same wording; only their GREEN barcodes
@@ -901,7 +897,7 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(po["C9"].value, red)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
-    def test_partial_catalog_barcodes_match_only_the_blank_row_description(self) -> None:
+    def test_partial_catalog_barcodes_allow_blank_row_code_fallback(self) -> None:
         red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
         blue = "MC-510 ก๊อกแฟนซีสี-น้ำเงิน(LB)"
         rows = combine([], [source_row(blue, barcode="000456", sales=3)])
@@ -933,16 +929,13 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(item_picture_colors(po), {9: (0, 0, 255)})
 
             catalog = main.build_catalog_map(str(catalog_path), "A0029")
-            with self.assertRaisesRegex(ValueError, r"(?i)BARCODE.*000456"):
-                main.resolve_catalog_variant(
-                    catalog, "MC-510", "unmatched source wording", 1,
-                    barcode="000456",
+            for description, count in (("unmatched source wording", 1), (blue, 2)):
+                selected = main.resolve_catalog_variant(
+                    catalog, "MC-510", description, count,
+                    description_variant_count=2, barcode="000456",
                 )
-            with self.assertRaisesRegex(ValueError, r"(?i)BARCODE.*000456"):
-                main.resolve_catalog_variant(
-                    catalog, "MC-510", blue, 2, description_variant_count=2,
-                    barcode="000456",
-                )
+                self.assertEqual(selected["brand"], "Blue brand")
+                self.assertEqual(selected["qty_per_carton"], 24)
 
     def test_missing_source_barcode_can_match_unique_catalog_description(self) -> None:
         red = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
@@ -1126,7 +1119,7 @@ class POVariantTests(unittest.TestCase):
                     catalog, "A-1704K", "Gray", 1, barcode="0001704"
                 )
 
-    def test_alias_codes_share_variant_count_for_catalog_safety(self) -> None:
+    def test_legacy_catalog_allows_multiple_source_variants_for_one_code_row(self) -> None:
         rows = combine([], [
             source_row("Gray", code="A-1704K", barcode="0001", sales=3),
             source_row("Blue", code="A-1704-K", barcode="0002", sales=4),
@@ -1143,12 +1136,15 @@ class POVariantTests(unittest.TestCase):
                  "carton": 48},
             ])
             with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
-                with self.assertRaisesRegex(ValueError, r"(?i)Ambiguous catalog variant"):
-                    main.generate_po_from_combined(
-                        rows, "A0029", datetime.date(2026, 9, 27), 6,
-                        str(TEMPLATE), str(catalog_path),
-                        str(output / "missing_vendors.xlsx"), 4, 7,
-                    )
+                po_path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 27), 6,
+                    str(TEMPLATE), str(catalog_path),
+                    str(output / "missing_vendors.xlsx"), 4, 7,
+                )
+            po = openpyxl.load_workbook(po_path)["PO"]
+            self.assertEqual([po[f"G{r}"].value for r in (9, 10)], [48, 48])
+            self.assertEqual({po[f"X{r}"].value for r in (9, 10)}, {"0001", "0002"})
+
 
 
 if __name__ == "__main__":
