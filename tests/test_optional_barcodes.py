@@ -350,14 +350,14 @@ class OptionalBarcodeTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows["ยอดขาย_TOTAL"].sum(), 5)
 
-    def test_asia_barcode_does_not_populate_a_missing_green_output_barcode(self) -> None:
+    def test_asia_barcode_populates_output_when_green_barcode_is_missing(self) -> None:
         rows = combine(
             [source_row("ฝารองนั่งวงรี-ขาว", barcode="0000123", sales=2)],
             [source_row("ฝารองนั่งรุ่นวงรี-สีขาว", sales=3)],
         )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows.iloc[0]["barcode"], "")
+        self.assertEqual(rows.iloc[0]["barcode"], "0000123")
         self.assertEqual(rows.iloc[0]["catalog_match_barcode"], "0000123")
 
     def test_sole_catalog_code_is_allowed_despite_multiple_source_variants(self) -> None:

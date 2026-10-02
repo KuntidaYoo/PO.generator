@@ -40,6 +40,7 @@ IMAGE_PADDING_PX = 2
 
 HIGHLIGHT_BELOW_MIN = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")
 HIGHLIGHT_MISSING_CATALOG = PatternFill(fill_type="solid", fgColor="FFFF00")
+BARCODE_MISMATCH_NOTE = "barcode ทั้ง2ไฟล์ไม่ตรงกัน"
 
 
 # =========================
@@ -918,7 +919,7 @@ def build_combined_all(
     min_factor: int,
     max_factor: int,
 ) -> pd.DataFrame:
-    """Match barcodes first, then legacy item codes with compatible variants."""
+    """Match barcodes first, then one-to-one code variants; GREEN takes priority."""
     # Use both files when deciding whether missing variant details are unique.
     # Otherwise a colorless ASIA row could be assigned red before GREEN's white
     # option is seen.
@@ -975,8 +976,9 @@ def build_combined_all(
             matches[ai] = candidates[0]
             used_green.add(candidates[0])
 
-    # Exact variant matches precede partial/truncated matches. Barcode-less
-    # wording differences no longer produce two lines for the same product.
+    # Exact variant matches precede partial/truncated matches. The same product
+    # may have different barcodes in the two reports; retain one-to-one variant
+    # matching and record the mismatch instead of producing duplicate PO lines.
     for exact_only in (True, False):
         for ai, a in enumerate(asia):
             if ai in matches:
@@ -986,7 +988,6 @@ def build_combined_all(
                 return (
                     other["buyer"] == candidate["buyer"]
                     and other["_norm_code"] == candidate["_norm_code"]
-                    and (not other["barcode"] or not candidate["barcode"])
                     and (other["_variant_key"] == candidate["_variant_key"] if exact_only
                          else variants_compatible(other["_variant_key"], candidate["_variant_key"]))
                 )
@@ -1007,8 +1008,10 @@ def build_combined_all(
     pairs.extend((None, g) for gi, g in enumerate(green) if gi not in used_green)
     for a, g in pairs:
         chosen = g if g is not None else a
+        asia_barcode = a["barcode"] if a is not None else ""
         green_barcode = g["barcode"] if g is not None else ""
-        source_barcode = green_barcode or (a["barcode"] if a is not None else "")
+        source_barcode = green_barcode or asia_barcode
+        barcode_mismatch = bool(asia_barcode and green_barcode and asia_barcode != green_barcode)
         green_price = g.get("หยวน_GREEN", np.nan) if g is not None else np.nan
         asia_price = a.get("หยวน_ASIA", np.nan) if a is not None else np.nan
         record = {
@@ -1018,7 +1021,11 @@ def build_combined_all(
                 g["รายละเอียดสินค้า_GREEN"] if g is not None
                 else a["รายละเอียดสินค้า_ASIA"]
             ),
-            "barcode": green_barcode,
+            "barcode": source_barcode,
+            "barcode_ASIA": asia_barcode,
+            "barcode_GREEN": green_barcode,
+            "barcode_mismatch": barcode_mismatch,
+            "หมายเหตุ": BARCODE_MISMATCH_NOTE if barcode_mismatch else "",
             "catalog_match_barcode": source_barcode,
             "หยวน_ASIA": asia_price,
             "หยวน_GREEN": green_price,
@@ -1030,7 +1037,8 @@ def build_combined_all(
         records.append(record)
 
     combined = pd.DataFrame(records, columns=[
-        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "barcode", "catalog_match_barcode",
+        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "barcode", "barcode_ASIA", "barcode_GREEN",
+        "barcode_mismatch", "หมายเหตุ", "catalog_match_barcode",
         "ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA", "หยวน_ASIA",
         "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN", "หยวน_GREEN", "หยวน",
     ])
@@ -1092,6 +1100,26 @@ def normalize_barcode(value, number_format: str = "") -> str:
     if barcode.isdigit() and re.fullmatch(r"0+", fmt):
         barcode = barcode.zfill(len(fmt))
     return barcode
+
+
+def source_barcode_mismatch(row) -> bool:
+    """Warn only when both source identifiers exist and differ."""
+    asia = normalize_barcode(row.get("barcode_ASIA"))
+    green = normalize_barcode(row.get("barcode_GREEN"))
+    return bool(asia and green and asia != green)
+
+
+def merge_notes(*values) -> str:
+    """Preserve each warning on its own line without repeating it."""
+    lines = []
+    for value in values:
+        if value is None or pd.isna(value):
+            continue
+        for line in str(value).splitlines():
+            line = line.strip()
+            if line and line not in lines:
+                lines.append(line)
+    return "\n".join(lines)
 
 
 class CatalogMap(dict):
@@ -1641,7 +1669,7 @@ def generate_po_from_combined(
     copy_column_widths(template_ws, ws)
 
     add_catalog_notes_column(ws)
-    # Keep the text-preserved PO-G barcode at the end after adding notes.
+    # Keep the preferred available source barcode at the end after adding notes.
     ws["Y8"].value = "BARCODE"
     ws["Y8"]._style = _copy(ws["X8"]._style)
     ws["Y9"]._style = _copy(ws["X9"]._style)
@@ -1776,6 +1804,9 @@ def generate_po_from_combined(
             notes = "\n".join(f'ไม่มี "{label}" ใน "{catalog_name}"' for _, label in missing_fields)
             for header, _ in missing_fields:
                 ws.cell(line, po_cols[header]).fill = HIGHLIGHT_MISSING_CATALOG
+        barcode_mismatch = source_barcode_mismatch(row)
+        notes = merge_notes(row.get("หมายเหตุ"),
+                            BARCODE_MISMATCH_NOTE if barcode_mismatch else "", notes)
         note_cell = ws.cell(line, po_cols["หมายเหตุ"])
         note_cell.value = notes or None
         if notes:
@@ -1801,6 +1832,8 @@ def generate_po_from_combined(
         barcode_cell = ws.cell(line, po_cols["BARCODE"])
         barcode_cell.value = po_barcode
         barcode_cell.number_format = "@"
+        if barcode_mismatch:
+            barcode_cell.fill = HIGHLIGHT_MISSING_CATALOG
         ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
         ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
         ws.cell(line, po_cols["Weight"]).value = cat.get("weight", "")
@@ -1912,59 +1945,69 @@ def generate_po_from_combined(
     return output_path
 
 def export_vendor_all_items_excel(vendor_rows_all: pd.DataFrame, vendor_code: str, out_folder: str = PO_OUTPUT_FOLDER) -> str:
-    """
-    Export ALL items for vendor. Highlight rows where TOTAL_QTY_NUM < MIN_NUM.
-    """
+    """Export all vendor items, keeping barcode warnings beside product names."""
     os.makedirs(out_folder, exist_ok=True)
     vendor_code = str(vendor_code).strip().upper()
     out_path = os.path.join(out_folder, f"PO_{vendor_code}_ALL_ITEMS.xlsx")
 
+    df_out = vendor_rows_all.copy()
+    df_out["หมายเหตุ"] = [
+        merge_notes(row.get("หมายเหตุ"), BARCODE_MISMATCH_NOTE if source_barcode_mismatch(row) else "")
+        for _, row in df_out.iterrows()
+    ]
     cols_wanted = [
-        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "barcode",
+        "buyer", "รหัสสินค้า", "รายละเอียดสินค้า", "หมายเหตุ", "barcode", "barcode_ASIA", "barcode_GREEN",
         "ยอดขาย_ASIA", "STOCK_ASIA", "ON_ORDER_ASIA", "หยวน_ASIA",
         "ยอดขาย_GREEN", "STOCK_GREEN", "ON_ORDER_GREEN", "หยวน_GREEN",
         "ยอดขาย_TOTAL", "ON_ORDER_TOTAL",
         "USE_MONTH", "TOTAL_QTY_NUM", "MIN_NUM", "MAX_NUM", "หยวน",
     ]
-    cols = [c for c in cols_wanted if c in vendor_rows_all.columns]
-
-    df_out = vendor_rows_all.copy()
+    cols = [c for c in cols_wanted if c in df_out.columns]
     if "รหัสสินค้า" in df_out.columns and "รายละเอียดสินค้า" in df_out.columns:
-        df_out = df_out.sort_values(["รหัสสินค้า", "รายละเอียดสินค้า"], ascending=[True, True])
+        df_out = df_out.sort_values(["รหัสสินค้า", "รายละเอียดสินค้า"], kind="stable")
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         df_out[cols].to_excel(writer, sheet_name="all_items", index=False)
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb["all_items"]
-
     header = {str(ws.cell(1, c).value).strip(): c for c in range(1, ws.max_column + 1)}
-    if "barcode" in header:
-        barcode_col = header["barcode"]
+    for name in ("barcode", "barcode_ASIA", "barcode_GREEN"):
+        if name not in header:
+            continue
+        barcode_col = header[name]
         ws.column_dimensions[get_column_letter(barcode_col)].width = 20
         for r in range(2, ws.max_row + 1):
             cell = ws.cell(r, barcode_col)
             if cell.value is not None:
                 cell.value = str(cell.value)
             cell.number_format = "@"
-    if "TOTAL_QTY_NUM" not in header or "MIN_NUM" not in header:
-        wb.save(out_path)
-        return out_path
 
-    col_total = header["TOTAL_QTY_NUM"]
-    col_min = header["MIN_NUM"]
+    if "TOTAL_QTY_NUM" in header and "MIN_NUM" in header:
+        col_total = header["TOTAL_QTY_NUM"]
+        col_min = header["MIN_NUM"]
+        for r in range(2, ws.max_row + 1):
+            tv = ws.cell(r, col_total).value
+            mv = ws.cell(r, col_min).value
+            try:
+                t = float(tv) if tv is not None else None
+                m = float(mv) if mv is not None else None
+            except (TypeError, ValueError):
+                continue
+            if t is not None and m is not None and t < m:
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).fill = HIGHLIGHT_BELOW_MIN
 
-    for r in range(2, ws.max_row + 1):
-        tv = ws.cell(r, col_total).value
-        mv = ws.cell(r, col_min).value
-        try:
-            t = float(tv) if tv is not None else None
-            m = float(mv) if mv is not None else None
-        except Exception:
-            continue
-        if t is not None and m is not None and t < m:
-            for c in range(1, ws.max_column + 1):
-                ws.cell(r, c).fill = HIGHLIGHT_BELOW_MIN
+    note_col = header["หมายเหตุ"]
+    ws.column_dimensions[get_column_letter(note_col)].width = 40
+    for r, (_, row) in enumerate(df_out.iterrows(), start=2):
+        note_cell = ws.cell(r, note_col)
+        note_cell.alignment = Alignment(vertical="top", wrap_text=True)
+        if source_barcode_mismatch(row):
+            note_cell.fill = HIGHLIGHT_MISSING_CATALOG
+            if "barcode" in header:
+                ws.cell(r, header["barcode"]).fill = HIGHLIGHT_MISSING_CATALOG
+            ws.row_dimensions[r].height = 32
 
     wb.save(out_path)
     return out_path
@@ -1996,12 +2039,12 @@ def generate_po_streamlit(
     if express_asia_path and os.path.exists(express_asia_path):
         df_asia, info_asia = parse_express_file(express_asia_path, "ASIA")
     else:
-        df_asia, info_asia = pd.DataFrame(), {"months": 1}
+        df_asia, info_asia = pd.DataFrame(), {"months": 0}
 
     if express_green_path and os.path.exists(express_green_path):
         df_green, info_green = parse_express_file(express_green_path, "GREEN")
     else:
-        df_green, info_green = pd.DataFrame(), {"months": 1}
+        df_green, info_green = pd.DataFrame(), {"months": 0}
 
     months = 1
     if info_asia and info_asia.get("months", 0) > 0:

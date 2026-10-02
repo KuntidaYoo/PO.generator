@@ -190,7 +190,7 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual(matching_red["MIN_NUM"], 36)
         self.assertEqual(matching_red["MAX_NUM"], 63)
 
-    def test_asia_only_row_has_no_po_barcode_and_parser_keeps_leading_zero(self) -> None:
+    def test_asia_only_row_keeps_available_barcode_and_parser_keeps_leading_zero(self) -> None:
         parsed_green = parsed_sample_row("000123", "ก็อกแฟนซีสี-แดง(R)")
         self.assertEqual(parsed_green["barcode"], "000123")
 
@@ -199,7 +199,7 @@ class POVariantTests(unittest.TestCase):
             [],
         )
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows.iloc[0]["barcode"], "")
+        self.assertEqual(rows.iloc[0]["barcode"], "999888")
         self.assertEqual(rows.iloc[0]["ยอดขาย_ASIA"], 6)
         self.assertEqual(rows.iloc[0]["ยอดขาย_GREEN"], 0)
 
@@ -335,7 +335,7 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual((row["STOCK_ASIA"], row["STOCK_GREEN"]), (2, 3))
         self.assertEqual(row["หยวน"], 29.69)
 
-    def test_missing_green_barcode_uses_asia_barcode_only_for_catalog(self) -> None:
+    def test_missing_green_barcode_uses_asia_barcode_for_catalog_and_output(self) -> None:
         name = "ก๊อกอ่างล้างหน้าด้ามยก-สีเทา"
         rows = combine(
             [source_row(name + "-IR", barcode="0001704", code="A-1704K", sales=2)],
@@ -344,7 +344,7 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows.iloc[0]
         self.assertEqual(row["รหัสสินค้า"], "A-1704-K")
-        self.assertEqual(row["barcode"], "")
+        self.assertEqual(row["barcode"], "0001704")
         self.assertEqual(row["catalog_match_barcode"], "0001704")
         self.assertEqual(row["ยอดขาย_TOTAL"], 5)
 
@@ -365,7 +365,7 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(po["A9"].value, "A-1704-K")
             self.assertEqual(po["C9"].value, name)
             self.assertEqual(po["H9"].value, 48)
-            self.assertIn(po["Y9"].value, (None, ""))
+            self.assertEqual(po["Y9"].value, "0001704")
 
     def test_item_code_parenthetical_color_is_part_of_variant_identity(self) -> None:
         rows = combine(
@@ -386,14 +386,16 @@ class POVariantTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(sorted(rows["ยอดขาย_TOTAL"].tolist()), [2, 3, 4])
 
-    def test_different_populated_barcodes_never_merge_by_name(self) -> None:
+    def test_different_populated_barcodes_merge_same_variant_with_green_priority(self) -> None:
         name = "CBS-320 same wording"
         rows = combine(
             [source_row(name, barcode="0001", code="CBS-320", sales=2)],
             [source_row(name, barcode="0002", code="CBS-320", sales=3)],
         )
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(sorted(rows["ยอดขาย_TOTAL"].tolist()), [2, 3])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.iloc[0]["ยอดขาย_TOTAL"], 5)
+        self.assertEqual(rows.iloc[0]["barcode"], "0002")
+        self.assertEqual(rows.iloc[0]["หมายเหตุ"], "barcode ทั้ง2ไฟล์ไม่ตรงกัน")
 
     def test_blank_barcode_variant_keeps_legacy_first_price(self) -> None:
         rows = combine([], [
@@ -963,13 +965,13 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(po["C9"].value, red)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
-    def test_asia_only_barcode_matches_catalog_but_po_barcode_stays_blank(self) -> None:
+    def test_asia_only_barcode_matches_catalog_and_is_written_to_po(self) -> None:
         rough_description = "MC-510 fancy faucet"
         catalog_description = "MC-510 ก๊อกแฟนซีสี-แดง(R)"
         rows = combine(
             [source_row(rough_description, barcode="000123", sales=3)], []
         )
-        self.assertEqual(rows.iloc[0]["barcode"], "")
+        self.assertEqual(rows.iloc[0]["barcode"], "000123")
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -991,7 +993,7 @@ class POVariantTests(unittest.TestCase):
                     4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            self.assertIsNone(po["Y9"].value)
+            self.assertEqual(po["Y9"].value, "000123")
             self.assertEqual(po["C9"].value, rough_description)
             self.assertEqual(po["H9"].value, 12)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
