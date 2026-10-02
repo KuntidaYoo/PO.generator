@@ -13,7 +13,7 @@ st.write("---")
 
 st.markdown("1. อัปโหลดไฟล์จาก EXPRESS (Greenlife และ AsiaHome)")
 up_express_files = st.file_uploader(
-    "อัปโหลดไฟล์ Express ASIA และ GREEN พร้อมกัน (.xlsx)",
+    "อัปโหลดไฟล์ Express ASIA และ GREEN (.xlsx)",
     type=["xlsx"], accept_multiple_files=True, key="express",
     help="เลือกทั้ง 2 ไฟล์ได้ในช่องเดียว ระบบจะแยก ASIA และ GREEN จากชื่อบริษัทในหัวรายงาน",
 )
