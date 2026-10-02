@@ -85,6 +85,7 @@ if btn:
             express_asia_path=str(p_asia),
             express_green_path=str(p_green),
             catalog_path=str(p_catalog),
+            catalog_filename=up_catalog.name,
             vendor_info_path=str(p_vendorinfo),
             template_path=str(p_template),
             vendor_code=vendor_code,

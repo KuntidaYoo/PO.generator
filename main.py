@@ -14,7 +14,7 @@ from PIL import Image as PILImage
 
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Border, Side, PatternFill
+from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
 from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
@@ -39,6 +39,7 @@ IMAGE_WIDTH_BOOST = 1.20
 IMAGE_PADDING_PX = 2
 
 HIGHLIGHT_BELOW_MIN = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")
+HIGHLIGHT_MISSING_CATALOG = PatternFill(fill_type="solid", fgColor="FFFF00")
 
 
 # =========================
@@ -1122,7 +1123,8 @@ def build_catalog_map(catalog_path: str, vendor_code: str) -> dict:
                 ws = wb[original]
                 break
         if ws is None:
-            raise RuntimeError(f"Catalog workbook has no sheet for vendor '{want}'. Available: {wb.sheetnames}")
+            wb.close()
+            return CatalogMap()
 
     COL_ITEM_NO = 1
     COL_PIC = 2
@@ -1215,7 +1217,7 @@ def resolve_catalog_variant(
             if source_barcode else entries
         )
         if not eligible:
-            if source_barcode and (catalog_map or barcode_index):
+            if source_barcode and entries:
                 raise ValueError(
                     f"No catalog BARCODE match for item {item_code}, barcode {source_barcode}. "
                     "QTY PER CARTON cannot be verified from another variant. "
@@ -1526,6 +1528,63 @@ def find_label_cell(ws, label: str, max_row: int = 60, max_col: int = 30):
     return None
 
 
+def add_catalog_notes_column(ws):
+    """Insert the notes column in the PO table, preserving the supplier header."""
+    # The template table starts at row 8. Its formulas refer only to table
+    # columns D onward, so moving that block translates every affected reference.
+    last_col = max(get_po_col_map(ws, header_row=HEADER_ROW).values())
+    last_row = ws.max_row
+    ws.move_range(f"D{HEADER_ROW}:{get_column_letter(last_col)}{last_row}", cols=1, translate=True)
+    # Expand grouped dimensions (for example I:J) before shifting widths.
+    original_dimensions = list(ws.column_dimensions.items())
+    table_dimensions = {}
+    for col in range(4, last_col + 1):
+        dimension = next((dim for key, dim in original_dimensions
+                          if (dim.min or column_index_from_string(key)) <= col
+                          <= (dim.max or column_index_from_string(key))), None)
+        if dimension is None:
+            dimension = ws.column_dimensions[get_column_letter(col)]
+        table_dimensions[col] = _copy(dimension)
+    for col in range(last_col, 3, -1):
+        new_letter = get_column_letter(col + 1)
+        dimension = table_dimensions[col]
+        dimension.index = new_letter
+        dimension.min = dimension.max = col + 1
+        ws.column_dimensions[new_letter] = dimension
+    ws.column_dimensions["D"].width = 48
+    for row in range(HEADER_ROW, last_row + 1):
+        ws.cell(row, 4)._style = _copy(ws.cell(row, 3)._style)
+        ws.cell(row, 4).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.cell(HEADER_ROW, 4).value = "หมายเหตุ"
+
+
+def catalog_missing_fields(catalog_entry):
+    """Return catalog metadata that is unavailable; barcode is optional."""
+    fields = (
+        ("qty_per_carton", "QTY PER CARTON", "carton"),
+        ("goods_desc", "GOODS DESCRIPTION", "รายละเอียดสินค้า"),
+        ("img_bytes", "GOODS PICTURE", "รูปสินค้า"),
+        ("brand", "BRAND", "ยี่ห้อ"),
+        ("material", "MATERIAL", "วัสดุ"),
+        ("weight", "Weight", "น้ำหนัก"),
+    )
+    missing = []
+    for key, header, label in fields:
+        value = catalog_entry.get(key)
+        if key == "qty_per_carton":
+            try:
+                valid = not isinstance(value, bool) and math.isfinite(float(value)) and float(value) > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                missing.append((header, label))
+        elif value is None or (isinstance(value, str) and not value.strip()) or (
+            isinstance(value, (int, float)) and not math.isfinite(value)
+        ) or (key == "img_bytes" and not value):
+            missing.append((header, label))
+    return missing
+
+
 # =========================
 # PO GENERATION
 # =========================
@@ -1542,6 +1601,7 @@ def generate_po_from_combined(
     variant_counts_by_code: Optional[Dict[str, int]] = None,
     variant_counts_by_code_description: Optional[Dict[Tuple[str, str], int]] = None,
     barcode_description_counts: Optional[Dict[Tuple[str, str], int]] = None,
+    catalog_filename: Optional[str] = None,
 ) -> str:
 
     if po_date is None:
@@ -1556,6 +1616,7 @@ def generate_po_from_combined(
     supplier_name = vendor_map.get(vendor_key, {}).get("name", "")
     supplier_addr = vendor_map.get(vendor_key, {}).get("address", "")
 
+    catalog_name = catalog_filename or os.path.basename(catalog_path)
     catalog_map = {}
     if os.path.exists(catalog_path):
         catalog_map = build_catalog_map(catalog_path, vendor_code=vendor_key)
@@ -1579,11 +1640,12 @@ def generate_po_from_combined(
 
     copy_column_widths(template_ws, ws)
 
-    # Extend the template by one final column for a text-preserved PO-G barcode.
-    ws["X8"].value = "BARCODE"
-    ws["X8"]._style = _copy(ws["W8"]._style)
-    ws["X9"]._style = _copy(ws["W9"]._style)
-    ws.column_dimensions["X"].width = 20
+    add_catalog_notes_column(ws)
+    # Keep the text-preserved PO-G barcode at the end after adding notes.
+    ws["Y8"].value = "BARCODE"
+    ws["Y8"]._style = _copy(ws["X8"]._style)
+    ws["Y9"]._style = _copy(ws["X9"]._style)
+    ws.column_dimensions["Y"].width = 20
 
     po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
 
@@ -1669,14 +1731,20 @@ def generate_po_from_combined(
         BASE_TOTAL_ROW += extra
 
     current_row = ITEM_START_ROW
+    # Snapshot before filling the first item so its warnings never leak to later rows.
+    item_styles = [_copy(ws.cell(TEMPLATE_ITEM_ROW, col)._style) for col in range(1, PO_LAST_COL + 1)]
+    item_height = ws.row_dimensions[TEMPLATE_ITEM_ROW].height or 15
+    incomplete_cartons = False
+    has_catalog_warnings = False
 
     for _, row in combined_df.iterrows():
 
         line = current_row
         current_row += 1
 
-        copy_row_style(ws, TEMPLATE_ITEM_ROW, line, PO_LAST_COL)
-        copy_row_height(ws, TEMPLATE_ITEM_ROW, line)
+        for col, style in enumerate(item_styles, start=1):
+            ws.cell(line, col)._style = _copy(style)
+        ws.row_dimensions[line].height = item_height
 
         buyer_item = str(row["รหัสสินค้า"]).strip()
         source_desc = str(row.get("รายละเอียดสินค้า") or "").strip()
@@ -1696,17 +1764,28 @@ def generate_po_from_combined(
             ),
         )
 
-        qty_per_carton = cat.get("qty_per_carton", "")
-        try:
-            qty_per_carton_num = float(qty_per_carton) if qty_per_carton not in [None, ""] else 0.0
-        except Exception:
-            qty_per_carton_num = 0.0
-        if not math.isfinite(qty_per_carton_num) or qty_per_carton_num <= 0:
-            barcode_label = source_barcode or "(blank)"
-            raise ValueError(
-                f"Missing or invalid QTY PER CARTON for item {buyer_item}, "
-                f"barcode {barcode_label}. Add a positive carton quantity in the catalog."
-            )
+        missing_fields = catalog_missing_fields(cat)
+        missing_carton = any(header == "QTY PER CARTON" for header, _ in missing_fields)
+        incomplete_cartons = incomplete_cartons or missing_carton
+        qty_per_carton_num = None if missing_carton else float(cat["qty_per_carton"])
+        if not cat:
+            notes = f'ไม่มีรายละเอียดสินค้าตัวนี้ อัปเดต "{catalog_name}"'
+            for col in range(1, PO_LAST_COL + 1):
+                ws.cell(line, col).fill = HIGHLIGHT_MISSING_CATALOG
+        else:
+            notes = "\n".join(f'ไม่มี "{label}" ใน "{catalog_name}"' for _, label in missing_fields)
+            for header, _ in missing_fields:
+                ws.cell(line, po_cols[header]).fill = HIGHLIGHT_MISSING_CATALOG
+        note_cell = ws.cell(line, po_cols["หมายเหตุ"])
+        note_cell.value = notes or None
+        if notes:
+            has_catalog_warnings = True
+            note_cell.fill = HIGHLIGHT_MISSING_CATALOG
+            # Include the template font size when allowing space for wrapped Thai.
+            font_size = note_cell.font.sz or 11
+            chars_per_line = max(12, int(ws.column_dimensions["D"].width * 7 / (font_size * 0.6)))
+            wrapped_lines = sum(max(1, math.ceil(len(part) / chars_per_line)) for part in notes.split("\n"))
+            ws.row_dimensions[line].height = min(409, max(item_height, font_size * 1.5 * wrapped_lines + 12))
 
         use_month = int(row["USE_MONTH"]) if not pd.isna(row["USE_MONTH"]) else 0
 
@@ -1725,10 +1804,11 @@ def generate_po_from_combined(
         ws.cell(line, po_cols["BRAND"]).value = cat.get("brand", "")
         ws.cell(line, po_cols["MATERIAL"]).value = cat.get("material", "")
         ws.cell(line, po_cols["Weight"]).value = cat.get("weight", "")
+        for header, _ in missing_fields:
+            if header not in ("GOODS DESCRIPTION", "GOODS PICTURE"):
+                ws.cell(line, po_cols[header]).value = None
 
-        ws.cell(line, po_cols["QTY PER CARTON"]).value = (
-            qty_per_carton_num if qty_per_carton_num > 0 else None
-        )
+        ws.cell(line, po_cols["QTY PER CARTON"]).value = qty_per_carton_num
 
         ws.cell(line, po_cols["STOCK GREEN"]).value = float(row["STOCK_GREEN"])
         ws.cell(line, po_cols["STOCK ASIA"]).value = float(row["STOCK_ASIA"])
@@ -1768,21 +1848,42 @@ def generate_po_from_combined(
 
         ws[f"{col_amt}{line}"] = f"={col_fob}{line}*{col_tot_order}{line}"
 
+        if missing_carton:
+            # Blank dependencies until a positive carton size is supplied in Excel.
+            # These formulas resume calculating if the user fills the yellow cell.
+            for col in (col_cart, col_green, col_asia, col_tot_order, col_zan, col_amt):
+                cell = ws[f"{col}{line}"]
+                expression = str(cell.value).lstrip("=")
+                cell.value = f'=IF(IFERROR(AND(ISNUMBER({col_qpc}{line}),{col_qpc}{line}>0),FALSE),{expression},"")'
+                cell.fill = HIGHLIGHT_MISSING_CATALOG
+
     if len(combined_df) > 0:
 
         last_item_row = ITEM_START_ROW + len(combined_df) - 1
+        if has_catalog_warnings:
+            verified_label = find_label_cell(ws, "เอกสารชุดนี้ได้ผ่านการตรวจสอบความถูกต้องจากผู้จัดทำแล้ว 100%",
+                                            max_row=ws.max_row, max_col=PO_LAST_COL)
+            if verified_label:
+                ws.cell(*verified_label).value = "โปรดอัปเดตข้อมูลที่ไฮไลต์สีเหลืองตามหมายเหตุ"
         force_bottom_border(ws, last_item_row, 1, PO_LAST_COL)
 
         # openpyxl moves the template's total rows when items are inserted,
         # but it does not update the formulas inside those rows.
         for col in (col_cart, col_tot_order, col_amt):
+            item_range = f"{col}{ITEM_START_ROW}:{col}{last_item_row}"
             ws[f"{col}{BASE_TOTAL_ROW}"] = (
-                f"=SUM({col}{ITEM_START_ROW}:{col}{last_item_row})"
+                f'=IF(COUNT({item_range})={len(combined_df)},SUM({item_range}),"")'
+                if incomplete_cartons else f"=SUM({item_range})"
             )
+            if incomplete_cartons:
+                ws[f"{col}{BASE_TOTAL_ROW}"].fill = HIGHLIGHT_MISSING_CATALOG
         ws[f"{col_amt}{BASE_TOTAL_ROW + 1}"] = float(rate_thb_per_cny)
         ws[f"{col_amt}{BASE_TOTAL_ROW + 2}"] = (
-            f"={col_amt}{BASE_TOTAL_ROW}*{col_amt}{BASE_TOTAL_ROW + 1}"
+            f'=IF({col_amt}{BASE_TOTAL_ROW}="","",{col_amt}{BASE_TOTAL_ROW}*{col_amt}{BASE_TOTAL_ROW + 1})'
+            if incomplete_cartons else f"={col_amt}{BASE_TOTAL_ROW}*{col_amt}{BASE_TOTAL_ROW + 1}"
         )
+        if incomplete_cartons:
+            ws[f"{col_amt}{BASE_TOTAL_ROW + 2}"].fill = HIGHLIGHT_MISSING_CATALOG
 
         pos_thb = find_label_cell(ws, "TOTAL AMOUNT THB", max_row=400, max_col=60)
         if not pos_thb:
@@ -1802,7 +1903,7 @@ def generate_po_from_combined(
         )
 
     wb.remove(template_ws)
-    ws.print_area = f"A1:X{ws.max_row}"
+    ws.print_area = f"A1:{get_column_letter(PO_LAST_COL)}{ws.max_row}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -1880,6 +1981,7 @@ def generate_po_streamlit(
     rate_thb_per_cny: float,
     min_factor: int,
     max_factor: int,
+    catalog_filename: Optional[str] = None,
 ) -> dict:
     """
     Streamlit entry:
@@ -1937,6 +2039,7 @@ def generate_po_streamlit(
             variant_counts_by_code=count_by_code,
             variant_counts_by_code_description=count_by_description,
             barcode_description_counts=count_by_barcode_description,
+            catalog_filename=catalog_filename,
         )
 
     return {

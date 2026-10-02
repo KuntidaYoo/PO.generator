@@ -481,6 +481,8 @@ class OptionalBarcodeTests(unittest.TestCase):
 
             po = openpyxl.load_workbook(path)["PO"]
             columns = main.get_po_col_map(po)
+            self.assertEqual(po["D8"].value, "หมายเหตุ")
+            self.assertEqual(columns["BARCODE"], 25)
             self.assertEqual(po.cell(9, columns["BUYER ITEM NO."]).value, "K1900")
             self.assertEqual(po.cell(9, columns["GOODS DESCRIPTION"]).value, green_description)
             self.assertEqual(po.cell(9, columns["QTY PER CARTON"]).value, 12)

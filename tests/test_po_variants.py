@@ -296,9 +296,9 @@ class POVariantTests(unittest.TestCase):
             for row_number in (9, 10):
                 code = po[f"A{row_number}"].value
                 self.assertEqual(po[f"C{row_number}"].value, green_names[code])
-                self.assertEqual(po[f"X{row_number}"].value, barcodes[code])
-                self.assertEqual(po[f"L{row_number}"].value, prices[code])
-                self.assertEqual(po[f"G{row_number}"].value, 48)
+                self.assertEqual(po[f"Y{row_number}"].value, barcodes[code])
+                self.assertEqual(po[f"M{row_number}"].value, prices[code])
+                self.assertEqual(po[f"H{row_number}"].value, 48)
 
     def test_blank_barcodes_match_after_ignoring_source_marker(self) -> None:
         rows = combine(
@@ -364,8 +364,8 @@ class POVariantTests(unittest.TestCase):
             po = openpyxl.load_workbook(po_path)["PO"]
             self.assertEqual(po["A9"].value, "A-1704-K")
             self.assertEqual(po["C9"].value, name)
-            self.assertEqual(po["G9"].value, 48)
-            self.assertIn(po["X9"].value, (None, ""))
+            self.assertEqual(po["H9"].value, 48)
+            self.assertIn(po["Y9"].value, (None, ""))
 
     def test_item_code_parenthetical_color_is_part_of_variant_identity(self) -> None:
         rows = combine(
@@ -533,12 +533,12 @@ class POVariantTests(unittest.TestCase):
                     str(output / "missing_vendors.xlsx"), 4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            for column in ("H", "K", "N"):
+            for column in ("I", "L", "O"):
                 self.assertEqual(po[f"{column}16"].value, f"=SUM({column}9:{column}15)")
-            self.assertEqual(po["N17"].value, 6)
-            self.assertEqual(po["N18"].value, "=N16*N17")
+            self.assertEqual(po["O17"].value, 6)
+            self.assertEqual(po["O18"].value, "=O16*O17")
 
-    def test_missing_carton_quantity_raises_before_writing_division_formula(self) -> None:
+    def test_missing_carton_quantity_is_blank_and_order_formula_is_guarded(self) -> None:
         rows = combine([], [source_row("Red", barcode="000123", sales=3)])
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -547,12 +547,17 @@ class POVariantTests(unittest.TestCase):
                 {"barcode": "000123", "description": "Red", "carton": None},
             ])
             with patch.object(main, "PO_OUTPUT_FOLDER", tmp):
-                with self.assertRaisesRegex(ValueError, r"QTY PER CARTON.*000123"):
-                    main.generate_po_from_combined(
-                        rows, "A0029", datetime.date(2026, 9, 27), 6,
-                        str(TEMPLATE), str(catalog_path),
-                        str(output / "missing_vendors.xlsx"), 4, 7,
-                    )
+                path = main.generate_po_from_combined(
+                    rows, "A0029", datetime.date(2026, 9, 27), 6,
+                    str(TEMPLATE), str(catalog_path),
+                    str(output / "missing_vendors.xlsx"), 4, 7,
+                )
+            po = openpyxl.load_workbook(path)["PO"]
+            self.assertIsNone(po["H9"].value)
+            self.assertIn('ไม่มี "carton" ใน "catalog.xlsx"', po["D9"].value)
+            self.assertTrue(po["I9"].value.startswith("=IF("))
+            self.assertIn("H9", po["I9"].value)
+            self.assertEqual(po["Y9"].value, "000123")
 
     def test_all_items_and_po_keep_leading_zero_barcode_as_text(self) -> None:
         description = "ก็อกแฟนซีสี-แดง(R)"
@@ -586,15 +591,15 @@ class POVariantTests(unittest.TestCase):
                     7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            self.assertEqual(po["X8"].value, "BARCODE")
-            self.assertEqual(po["X9"].value, "000123")
-            self.assertEqual(po["X9"].data_type, "s")
+            self.assertEqual(po["Y8"].value, "BARCODE")
+            self.assertEqual(po["Y9"].value, "000123")
+            self.assertEqual(po["Y9"].data_type, "s")
             self.assertEqual(po["C9"].value, description)
-            self.assertEqual(po["R9"].value, 3)
-            self.assertEqual(po["S9"].value, 1)
+            self.assertEqual(po["S9"].value, 3)
             self.assertEqual(po["T9"].value, 1)
-            self.assertEqual(po["O9"].value, 2)
-            self.assertIn("$X", str(po.print_area))
+            self.assertEqual(po["U9"].value, 1)
+            self.assertEqual(po["P9"].value, 2)
+            self.assertIn("$Y", str(po.print_area))
 
     def test_two_po_variants_keep_independent_prices_and_formula_rows(self) -> None:
         red = "ก็อกแฟนซีสี-แดง(R)"
@@ -625,7 +630,7 @@ class POVariantTests(unittest.TestCase):
                     7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            by_barcode = {po[f"X{r}"].value: r for r in (9, 10)}
+            by_barcode = {po[f"Y{r}"].value: r for r in (9, 10)}
             self.assertEqual(set(by_barcode), {"000123", "000456"})
 
             for barcode, description, price in (
@@ -634,19 +639,19 @@ class POVariantTests(unittest.TestCase):
             ):
                 row = by_barcode[barcode]
                 self.assertEqual(po[f"C{row}"].value, description)
-                self.assertEqual(po[f"G{row}"].value, 10)
-                self.assertEqual(po[f"L{row}"].value, price)
-                self.assertAlmostEqual(po[f"M{row}"].value, price * 6)
-                self.assertEqual(po[f"N{row}"].value, f"=L{row}*K{row}")
-                self.assertEqual(po[f"K{row}"].value, f"=I{row}+J{row}")
-                self.assertEqual(po[f"X{row}"].data_type, "s")
+                self.assertEqual(po[f"H{row}"].value, 10)
+                self.assertEqual(po[f"M{row}"].value, price)
+                self.assertAlmostEqual(po[f"N{row}"].value, price * 6)
+                self.assertEqual(po[f"O{row}"].value, f"=M{row}*L{row}")
+                self.assertEqual(po[f"L{row}"].value, f"=J{row}+K{row}")
+                self.assertEqual(po[f"Y{row}"].data_type, "s")
 
-            total_formula = po["N14"].value
-            total_range = re.fullmatch(r"=SUM\(N(\d+):N(\d+)\)", total_formula or "")
+            total_formula = po["O14"].value
+            total_range = re.fullmatch(r"=SUM\(O(\d+):O(\d+)\)", total_formula or "")
             self.assertIsNotNone(total_range)
             self.assertLessEqual(int(total_range.group(1)), 9)
             self.assertGreaterEqual(int(total_range.group(2)), 10)
-            self.assertIn("$X", str(po.print_area))
+            self.assertIn("$Y", str(po.print_area))
 
     def test_exact_catalog_descriptions_select_matching_images(self) -> None:
         red = "ก็อกแฟนซีสี-แดง(R)"
@@ -718,7 +723,7 @@ class POVariantTests(unittest.TestCase):
             self.assertEqual(len(item_images), 1)
             color = PILImage.open(BytesIO(item_images[0]._data())).convert("RGB").getpixel((0, 0))
             self.assertEqual(color, (0, 0, 255))
-            self.assertEqual(po["G9"].value, 10)
+            self.assertEqual(po["H9"].value, 10)
 
     def test_legacy_catalog_uses_last_code_rows_carton_quantity(self) -> None:
         rows = combine([], [source_row("ก็อกแฟนซีสี-แดง(R)", barcode="000123", sales=3)])
@@ -734,8 +739,8 @@ class POVariantTests(unittest.TestCase):
                         4, 7, variant_counts_by_code={"MC-510": 2},
                     )
                 po = openpyxl.load_workbook(po_path)["PO"]
-                self.assertEqual(po["G9"].value, quantities[-1])
-                self.assertEqual(po["X9"].value, "000123")
+                self.assertEqual(po["H9"].value, quantities[-1])
+                self.assertEqual(po["Y9"].value, "000123")
 
     def test_catalog_barcode_selects_color_pictures_and_metadata(self) -> None:
         # Both Express rows have the same wording; only their GREEN barcodes
@@ -771,9 +776,9 @@ class POVariantTests(unittest.TestCase):
                     4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            by_barcode = {po[f"X{row}"].value: row for row in (9, 10)}
+            by_barcode = {po[f"Y{row}"].value: row for row in (9, 10)}
             self.assertEqual(set(by_barcode), {"000123", "000456"})
-            self.assertTrue(all(po[f"X{row}"].data_type == "s" for row in by_barcode.values()))
+            self.assertTrue(all(po[f"Y{row}"].data_type == "s" for row in by_barcode.values()))
             expected = {
                 "000123": ("Red brand", "Red metal", 1.25, 12, (255, 0, 0)),
                 "000456": ("Blue brand", "Blue metal", 2.5, 24, (0, 0, 255)),
@@ -782,10 +787,10 @@ class POVariantTests(unittest.TestCase):
             for barcode, (brand, material, weight, carton, color) in expected.items():
                 row = by_barcode[barcode]
                 self.assertEqual(po[f"C{row}"].value, "MC-510 fancy faucet")
-                self.assertEqual(po[f"D{row}"].value, brand)
-                self.assertEqual(po[f"E{row}"].value, material)
-                self.assertEqual(po[f"F{row}"].value, weight)
-                self.assertEqual(po[f"G{row}"].value, carton)
+                self.assertEqual(po[f"E{row}"].value, brand)
+                self.assertEqual(po[f"F{row}"].value, material)
+                self.assertEqual(po[f"G{row}"].value, weight)
+                self.assertEqual(po[f"H{row}"].value, carton)
                 self.assertEqual(pictures[row], color)
 
     def test_catalog_barcode_matches_across_item_code_typo(self) -> None:
@@ -813,11 +818,11 @@ class POVariantTests(unittest.TestCase):
             po = openpyxl.load_workbook(po_path)["PO"]
             self.assertEqual(po["A9"].value, "A-1704K")
             self.assertEqual(po["C9"].value, green_description)
-            self.assertEqual(po["D9"].value, "Donmark")
-            self.assertEqual(po["E9"].value, "ZINC")
-            self.assertEqual(po["F9"].value, 501)
-            self.assertEqual(po["G9"].value, 48)
-            self.assertEqual(po["X9"].value, "0001704")
+            self.assertEqual(po["E9"].value, "Donmark")
+            self.assertEqual(po["F9"].value, "ZINC")
+            self.assertEqual(po["G9"].value, 501)
+            self.assertEqual(po["H9"].value, 48)
+            self.assertEqual(po["Y9"].value, "0001704")
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
     def test_catalog_barcode_matches_row_without_item_code(self) -> None:
@@ -923,9 +928,9 @@ class POVariantTests(unittest.TestCase):
             po = openpyxl.load_workbook(po_path)["PO"]
             self.assertEqual(po["A9"].value, "MC-510")
             self.assertEqual(po["C9"].value, blue)
-            self.assertEqual(po["D9"].value, "Blue brand")
-            self.assertEqual(po["G9"].value, 24)
-            self.assertEqual(po["X9"].value, "000456")
+            self.assertEqual(po["E9"].value, "Blue brand")
+            self.assertEqual(po["H9"].value, 24)
+            self.assertEqual(po["Y9"].value, "000456")
             self.assertEqual(item_picture_colors(po), {9: (0, 0, 255)})
 
             catalog = main.build_catalog_map(str(catalog_path), "A0029")
@@ -954,7 +959,7 @@ class POVariantTests(unittest.TestCase):
                     4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            self.assertIsNone(po["X9"].value)
+            self.assertIsNone(po["Y9"].value)
             self.assertEqual(po["C9"].value, red)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
@@ -986,9 +991,9 @@ class POVariantTests(unittest.TestCase):
                     4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            self.assertIsNone(po["X9"].value)
+            self.assertIsNone(po["Y9"].value)
             self.assertEqual(po["C9"].value, rough_description)
-            self.assertEqual(po["G9"].value, 12)
+            self.assertEqual(po["H9"].value, 12)
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
     def test_shared_source_barcode_combines_descriptions_and_uses_one_picture(self) -> None:
@@ -1015,7 +1020,7 @@ class POVariantTests(unittest.TestCase):
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
             self.assertEqual(po["C9"].value, red)
-            self.assertEqual(po["X9"].value, "000123")
+            self.assertEqual(po["Y9"].value, "000123")
             self.assertEqual(item_picture_colors(po), {9: (255, 0, 0)})
 
     def test_duplicate_catalog_barcode_does_not_choose_matching_description(self) -> None:
@@ -1142,8 +1147,8 @@ class POVariantTests(unittest.TestCase):
                     str(output / "missing_vendors.xlsx"), 4, 7,
                 )
             po = openpyxl.load_workbook(po_path)["PO"]
-            self.assertEqual([po[f"G{r}"].value for r in (9, 10)], [48, 48])
-            self.assertEqual({po[f"X{r}"].value for r in (9, 10)}, {"0001", "0002"})
+            self.assertEqual([po[f"H{r}"].value for r in (9, 10)], [48, 48])
+            self.assertEqual({po[f"Y{r}"].value for r in (9, 10)}, {"0001", "0002"})
 
 
 
