@@ -40,6 +40,19 @@ class MarchLogicTests(unittest.TestCase):
         self.assertEqual(row["MAX_NUM"], 42)
         self.assertNotIn("หมายเหตุ", result.columns)
 
+    def test_separate_monthly_usage_preserves_combined_rounding(self):
+        cases = [([source(sales=1)], [source(sales=1)], (0, 0, 1)),
+                 ([source(sales=5)], [], (0, 2, 2)),
+                 ([], [source(sales=5)], (2, 0, 2)),
+                 ([source(sales=0)], [source(sales=0)], (0, 0, 0))]
+        for asia, green, expected in cases:
+            with self.subTest(expected=expected):
+                row = combine(asia, green).iloc[0]
+                self.assertEqual(tuple(row[k] for k in
+                    ("USE_MONTH_GREEN", "USE_MONTH_ASIA", "USE_MONTH")), expected)
+                self.assertEqual(row["MIN_NUM"], expected[2] * 4)
+                self.assertEqual(row["MAX_NUM"], expected[2] * 7)
+
     def test_exact_item_codes_remain_separate_even_with_same_barcode(self):
         rows = combine([source(code="MC-1", barcode="001")], [source(code="MC1", barcode="001")])
         self.assertEqual(len(rows), 2)
@@ -93,21 +106,27 @@ class MarchLogicTests(unittest.TestCase):
             self.assertEqual(ws["D8"].value, "BRAND")
             self.assertEqual(ws["D9"].value, "Brand 2")
             self.assertEqual(ws["G9"].value, 24)
-            self.assertEqual(ws["H9"].value, "=ROUND((Q9-U9)/G9,0)")
+            self.assertEqual([ws.cell(8, c).value for c in (15, 16, 17)],
+                             ["USE G", "USE A", "USE MONTH"])
+            self.assertEqual([ws.cell(9, c).value for c in (15, 16, 17)], [2, 0, 2])
+            self.assertEqual(ws["R9"].value, "=Q9*4")
+            self.assertEqual(ws["S9"].value, "=Q9*7")
+            self.assertEqual(ws["W9"].value, "=T9+U9+V9")
+            self.assertEqual(ws["H9"].value, "=ROUND((S9-W9)/G9,0)")
             self.assertEqual(ws["N9"].value, "=L9*K9")
-            self.assertEqual(ws["X8"].value, "BARCODE")
-            self.assertEqual(ws["X9"].value, "0000123")
-            self.assertEqual(ws["X9"].data_type, "s")
-            self.assertEqual(ws["X9"].number_format, "@")
+            self.assertEqual(ws["Z8"].value, "BARCODE")
+            self.assertEqual(ws["Z9"].value, "0000123")
+            self.assertEqual(ws["Z9"].data_type, "s")
+            self.assertEqual(ws["Z9"].number_format, "@")
             self.assertNotIn("หมายเหตุ", [c.value for c in ws[8]])
-            self.assertIn("$X", str(ws.print_area))
+            self.assertIn("$Z", str(ws.print_area))
 
     def test_missing_catalog_retains_march_blank_fields_and_unguarded_formulas(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self.generate(tmp, [])
             self.assertIsNone(ws["G9"].value)
-            self.assertEqual(ws["H9"].value, "=ROUND((Q9-U9)/G9,0)")
-            self.assertEqual(ws["X9"].value, "0000123")
+            self.assertEqual(ws["H9"].value, "=ROUND((S9-W9)/G9,0)")
+            self.assertEqual(ws["Z9"].value, "0000123")
 
 
 if __name__ == "__main__":

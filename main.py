@@ -664,6 +664,10 @@ def build_combined_all(df_asia: pd.DataFrame, df_green: pd.DataFrame, months: in
         months = 1
 
     combined["USE_MONTH"] = combined["ยอดขาย_TOTAL"].apply(lambda v: round_half_up(v / months) if v > 0 else 0)
+    for source in ("GREEN", "ASIA"):
+        combined[f"USE_MONTH_{source}"] = combined[f"ยอดขาย_{source}"].apply(
+            lambda v: round_half_up(v / months) if v > 0 else 0
+        )
     combined["TOTAL_QTY_NUM"] = combined["STOCK_ASIA"] + combined["STOCK_GREEN"] + combined["ON_ORDER_TOTAL"]
     combined["MIN_NUM"] = combined["USE_MONTH"] * int(min_factor)
     combined["MAX_NUM"] = combined["USE_MONTH"] * int(max_factor)
@@ -1058,11 +1062,11 @@ def generate_po_from_combined(
 
     copy_column_widths(template_ws, ws)
 
-    # Append the barcode without shifting any original template column.
-    ws["X8"].value = "BARCODE"
-    ws["X8"]._style = _copy(ws["W8"]._style)
-    ws["X9"]._style = _copy(ws["W9"]._style)
-    ws.column_dimensions["X"].width = 20
+    # Append the barcode after the monthly usage and existing PO columns.
+    ws["Z8"].value = "BARCODE"
+    ws["Z8"]._style = _copy(ws["Y8"]._style)
+    ws["Z9"]._style = _copy(ws["Y9"]._style)
+    ws.column_dimensions["Z"].width = 20
 
     po_cols = get_po_col_map(ws, header_row=HEADER_ROW)
 
@@ -1175,6 +1179,8 @@ def generate_po_from_combined(
         ws.cell(line, po_cols["STOCK GREEN"]).value = float(row["STOCK_GREEN"])
         ws.cell(line, po_cols["STOCK ASIA"]).value = float(row["STOCK_ASIA"])
         ws.cell(line, po_cols["ON ORDER"]).value = float(row["ON_ORDER_TOTAL"])
+        ws.cell(line, po_cols["USE G"]).value = int(row["USE_MONTH_GREEN"])
+        ws.cell(line, po_cols["USE A"]).value = int(row["USE_MONTH_ASIA"])
         ws.cell(line, po_cols["USE MONTH"]).value = use_month
 
         col_use = get_column_letter(po_cols["USE MONTH"])
@@ -1233,7 +1239,7 @@ def generate_po_from_combined(
         )
 
     wb.remove(template_ws)
-    ws.print_area = f"A1:X{ws.max_row}"
+    ws.print_area = f"A1:Z{ws.max_row}"
     wb.save(output_path)
 
     return output_path
